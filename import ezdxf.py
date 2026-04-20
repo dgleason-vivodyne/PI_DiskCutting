@@ -392,13 +392,17 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
     # Ensure the first point starts with (0,0) velocity
     for i in range(1, len(points)):
         p1, p2 = np.array(points[i - 1]), np.array(points[i])
-        dist = np.linalg.norm(p2 - p1)
+        dist = float(np.linalg.norm(p2 - p1))
 
         time_needed = calculate_time_to_move(dist, max_velocity, max_acceleration)
 
-        # Calculate velocities in both directions
-        horizontal_velocity = (p2[0] - p1[0]) / time_needed
-        vertical_velocity = (p2[1] - p1[1]) / time_needed
+        # Zero-length step: calculate_time_to_move returns 0; avoid divide-by-zero / invalid velocity
+        if dist <= 1e-15 or time_needed <= 1e-15:
+            horizontal_velocity = 0.0
+            vertical_velocity = 0.0
+        else:
+            horizontal_velocity = (p2[0] - p1[0]) / time_needed
+            vertical_velocity = (p2[1] - p1[1]) / time_needed
 
         # Append time and velocity for the current step
         relative_times.append(time_needed) #time in msec
