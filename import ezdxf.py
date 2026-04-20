@@ -10,7 +10,23 @@ import matplotlib.pyplot as plt
 from scipy.spatial import KDTree
 import math
 
-# Interpolation functions 
+
+def resolve_dxf_path(dxf_file):
+    """Resolve DXF path: absolute paths unchanged; relative paths tried from CWD then this script's directory."""
+    if not dxf_file or not str(dxf_file).strip():
+        raise FileNotFoundError("DXF path is empty.")
+    path = os.path.normpath(os.path.expanduser(str(dxf_file).strip()))
+    if os.path.isabs(path) and os.path.isfile(path):
+        return path
+    if os.path.isfile(path):
+        return os.path.abspath(path)
+    here = os.path.dirname(os.path.abspath(__file__))
+    alt = os.path.join(here, path)
+    if os.path.isfile(alt):
+        return alt
+    raise FileNotFoundError(f"DXF not found: {dxf_file!r} (tried CWD and {alt})")
+
+# Interpolation functions
 def interpolate_arc(center, radius, start_angle, end_angle, spacing):
     """Interpolates points along an arc with equal spacing."""
     start_angle = np.radians(start_angle)
