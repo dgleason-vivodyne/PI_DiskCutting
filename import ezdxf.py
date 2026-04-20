@@ -474,14 +474,6 @@ def optimize_path(points):
                 break
     return sorted_points[optimized_order]
 
-def remove_close_points(points, fuzz):
-    """Removes points that are within 'fuzz' distance of each other."""
-    unique_points = []
-    for i, point in enumerate(points):
-        if not any(np.linalg.norm(point - p) < fuzz for p in unique_points):
-            unique_points.append(point)
-    return np.array(unique_points)
-
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
     """Calculate the time to move a given distance considering max velocity and max acceleration."""
     if distance == 0:
