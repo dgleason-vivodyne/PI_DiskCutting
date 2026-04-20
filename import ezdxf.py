@@ -329,24 +329,21 @@ def travel_polyline_between(prev_exit, entry, spacing, dense=True):
     return np.vstack([a, b])
 
 
-def dedupe_consecutive_points(points, is_cut, eps_mm):
-    """
-    Drop consecutive rows that represent the same location (stitch duplicates, float noise).
-    When merging two rows, keep is_cut = (logical or) so a travel|cut junction becomes cut.
-    """
+def dedupe_consecutive_points(points, eps_mm):
+    """Drop consecutive rows at the same location (stitch duplicates, float noise)."""
     pts = np.asarray(points, dtype=float)
     if len(pts) == 0:
-        return pts, is_cut
-    ic = np.asarray(is_cut, dtype=bool)
+        return pts
     out_p = [pts[0]]
-    out_c = [ic[0]]
     for i in range(1, len(pts)):
-        if float(np.linalg.norm(pts[i] - out_p[-1])) < eps_mm:
-            out_c[-1] = out_c[-1] or ic[i]
-            continue
-        out_p.append(pts[i])
-        out_c.append(ic[i])
-    return np.array(out_p, dtype=float), np.array(out_c, dtype=bool)
+        if float(np.linalg.norm(pts[i] - out_p[-1])) >= eps_mm:
+            out_p.append(pts[i])
+    return np.array(out_p, dtype=float)
+
+
+def bridge_junction_epsilon_mm(spacing_mm):
+    """Tolerance for travel/cut stitches; keep CSV dedupe aligned with build_cutting_path_with_bridges."""
+    return max(1e-6, float(spacing_mm) * 1e-4)
 
 
 def build_cutting_path_with_bridges(
