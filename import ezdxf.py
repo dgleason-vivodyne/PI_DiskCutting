@@ -40,7 +40,7 @@ def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, 
 
 def generate_points_from_dxf(dxf_file, spacing):
     """Extracts points from DXF ARC, LINE, CIRCLE, and ELLIPSE entities with equal spacing."""
-    dxf_file = "C:/Users/DaveGleason/Desktop/DMS PYTHON MOTION TESTING/SingleChipUpperLung.dxf"
+    dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
     doc = ezdxf.readfile(dxf_file)
     msp = doc.modelspace()
     points = []
