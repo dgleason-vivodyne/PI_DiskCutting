@@ -55,7 +55,7 @@ def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, 
     return ellipse_points
 
 def generate_points_from_dxf(dxf_file, spacing):
-    """Extracts points from DXF ARC, LINE, CIRCLE, and ELLIPSE entities with equal spacing."""
+    """Extracts points from DXF LINE, ARC, CIRCLE, ELLIPSE on layers that are on; skips Startpoints."""
     dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
     doc = ezdxf.readfile(dxf_file)
     msp = doc.modelspace()
@@ -63,6 +63,8 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     # Process LINE entities
     for entity in msp.query("LINE"):
+        if not _entity_layer_processed(doc, entity):
+            continue
         start_point = np.array((entity.dxf.start.x, entity.dxf.start.y))
         end_point = np.array((entity.dxf.end.x, entity.dxf.end.y))
         distance = np.linalg.norm(end_point - start_point)
@@ -73,6 +75,8 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     # Process ARC entities
     for entity in msp.query("ARC"):
+        if not _entity_layer_processed(doc, entity):
+            continue
         center = (entity.dxf.center.x, entity.dxf.center.y)
         radius = entity.dxf.radius
         start_angle = entity.dxf.start_angle
@@ -83,6 +87,8 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     # Process CIRCLE entities
     for entity in msp.query("CIRCLE"):
+        if not _entity_layer_processed(doc, entity):
+            continue
         center = (entity.dxf.center.x, entity.dxf.center.y)
         radius = entity.dxf.radius
 
@@ -91,6 +97,8 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     # Process ELLIPSE entities
     for entity in msp.query("ELLIPSE"):
+        if not _entity_layer_processed(doc, entity):
+            continue
         center = (entity.dxf.center.x, entity.dxf.center.y)
         major_axis = entity.dxf.major_axis.magnitude  # No division by 2
         minor_axis = major_axis * entity.dxf.ratio  # Calculate the semi-minor axis using the ratio
