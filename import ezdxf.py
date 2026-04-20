@@ -59,264 +59,623 @@ def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, 
     ellipse_points = [(center[0] + np.cos(a) * major_axis, center[1] + np.sin(a) * minor_axis) for a in angles]
     return ellipse_points
 
-def generate_points_from_dxf(dxf_file, spacing):
-    """Extracts points from DXF ARC, LINE, CIRCLE, and ELLIPSE entities with equal spacing."""
-    dxf_file = "C:/Users/DaveGleason/Desktop/DMS PYTHON MOTION TESTING/SingleChipUpperLung.dxf"
-    doc = ezdxf.readfile(dxf_file)
-    msp = doc.modelspace()
-    points = []
+def _contour_dict(points, closed, dxftype, entity_index, source="entity"):
+    return {
+        "points": points,
+        "closed": closed,
+        "dxftype": dxftype,
+        "entity_index": entity_index,
+        "source": source,
+    }
 
-    # Process LINE entities
-    for entity in msp.query("LINE"):
-        start_point = np.array((entity.dxf.start.x, entity.dxf.start.y))
-        end_point = np.array((entity.dxf.end.x, entity.dxf.end.y))
-        distance = np.linalg.norm(end_point - start_point)
-        num_points = max(2, int(distance / spacing))
 
-        segment_points = np.linspace(start_point, end_point, num_points)
-        points.extend(segment_points)
-
-    # Process ARC entities
-    for entity in msp.query("ARC"):
+def interpolate_entity_xy(entity, spacing):
+    """
+    Sample one supported entity to a polyline in WCS (mm). Order follows entity geometry.
+    Returns (N,2) float array or None if unsupported / empty.
+    """
+    dt = entity.dxftype()
+    if dt == "LINE":
+        start_point = np.array((entity.dxf.start.x, entity.dxf.start.y), dtype=float)
+        end_point = np.array((entity.dxf.end.x, entity.dxf.end.y), dtype=float)
+        dist = np.linalg.norm(end_point - start_point)
+        n = max(2, int(dist / spacing))
+        return np.linspace(start_point, end_point, n)
+    if dt == "ARC":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        radius = entity.dxf.radius
-        start_angle = entity.dxf.start_angle
-        end_angle = entity.dxf.end_angle
-
-        arc_points = interpolate_arc(center, radius, start_angle, end_angle, spacing)
-        points.extend(arc_points)
-
-    # Process CIRCLE entities
-    for entity in msp.query("CIRCLE"):
+        arc_pts = interpolate_arc(center, entity.dxf.radius, entity.dxf.start_angle, entity.dxf.end_angle, spacing)
+        return np.array(arc_pts, dtype=float)
+    if dt == "CIRCLE":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        radius = entity.dxf.radius
-
-        circle_points = interpolate_circle(center, radius, spacing)
-        points.extend(circle_points)
-
-    # Process ELLIPSE entities
-    for entity in msp.query("ELLIPSE"):
+        circ_pts = interpolate_circle(center, entity.dxf.radius, spacing)
+        return np.array(circ_pts, dtype=float)
+    if dt == "ELLIPSE":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        major_axis = entity.dxf.major_axis.magnitude  # No division by 2
-        minor_axis = major_axis * entity.dxf.ratio  # Calculate the semi-minor axis using the ratio
-        start_param = entity.dxf.start_param
-        end_param = entity.dxf.end_param
-
-        # Interpolate ellipse points
-        ellipse_points = interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, spacing)
-
-        # Rotate ellipse points 90 degrees clockwise about the center point
-        rotated_ellipse_points = []
+        major_axis = entity.dxf.major_axis.magnitude
+        minor_axis = major_axis * entity.dxf.ratio
+        ellipse_points = interpolate_ellipse(
+            center, major_axis, minor_axis, entity.dxf.start_param, entity.dxf.end_param, spacing
+        )
+        rotated = []
         for (x, y) in ellipse_points:
-            # Translate points to origin
-            x_shifted = x - center[0]
-            y_shifted = y - center[1]
+            x_shifted, y_shifted = x - center[0], y - center[1]
+            rotated.append((-y_shifted + center[0], x_shifted + center[1]))
+        return np.array(rotated, dtype=float)
+    return None
 
-            # Rotate 90 degrees clockwise: (x', y') = (y, -x)
-            x_rotated = -y_shifted
-            y_rotated = x_shifted
 
-            # Translate back to the original center
-            rotated_ellipse_points.append((x_rotated + center[0], y_rotated + center[1]))
+def _infer_chain_closed(points, spacing, gap_threshold, single_circle, single_full_ellipse):
+    """Decide if a merged point chain is a closed loop for overlap / traversal."""
+    p = np.asarray(points, dtype=float)
+    if len(p) < 3:
+        return False
+    if single_circle:
+        return True
+    if single_full_ellipse:
+        return True
+    d_close = float(np.linalg.norm(p[0] - p[-1]))
+    # Closed bean: seam meets; allow modest sampling gap
+    return d_close <= max(spacing * 3.0, gap_threshold * 0.5)
 
-        points.extend(rotated_ellipse_points)
 
-    return np.array(points)
+def generate_contours_from_dxf(dxf_file, spacing, gap_multiplier=5.0):
+    """
+    Walk modelspace in **entity order**. Many LINE/ARC pieces are un-joined segments of one
+    logical shape: merge into one contour while the gap from the previous endpoint to this
+    entity's start is **not** a large jump. A **new** contour starts when that gap exceeds
+    ``gap_multiplier * spacing`` (e.g. 5 × 0.01 mm = 0.05 mm between separate shapes).
 
-def remove_close_points(points, fuzz):
-    """Removes points that are within 'fuzz' distance of each other."""
-    tree = KDTree(points)
-    unique_points = []
+    Contour dict keys: points, closed, dxftype (label), entity_index (chain index), source.
+    """
+    path = resolve_dxf_path(dxf_file)
+    doc = ezdxf.readfile(path)
+    msp = doc.modelspace()
+    gap_threshold = float(gap_multiplier) * float(spacing)
+    stitch_eps = max(float(spacing) * 0.25, 1e-9)
 
-    for i, point in enumerate(points):
-        # Query all points within fuzz distance from the current point
-        if not any(np.linalg.norm(point - p) < fuzz for p in unique_points):
-            unique_points.append(point)
+    chains = []
+    current = None
+    chain_entities = []
 
-    return np.array(unique_points)
+    for entity in msp:
+        dt = entity.dxftype()
+        if dt not in ("LINE", "ARC", "CIRCLE", "ELLIPSE"):
+            continue
+        raw = interpolate_entity_xy(entity, spacing)
+        if raw is None or len(raw) == 0:
+            continue
 
-# Function to compute time based on max velocity and max acceleration
-def calculate_time_to_move(distance, max_velocity, max_acceleration):
-    """Calculate the time to move a given distance considering max velocity and max acceleration."""
-    if distance == 0:  # Avoid division by zero in case of zero distance
+        if current is None:
+            current = raw.copy()
+            chain_entities = [entity]
+            continue
+
+        d_joint = float(np.linalg.norm(raw[0] - current[-1]))
+        # Weld: shared vertex between consecutive entities of the same logical shape
+        if d_joint < stitch_eps:
+            add = raw[1:] if len(raw) > 1 else np.empty((0, 2))
+        else:
+            add = raw
+
+        if d_joint > gap_threshold:
+            chains.append((current, chain_entities))
+            current = raw.copy()
+            chain_entities = [entity]
+        else:
+            if len(add) > 0:
+                current = np.vstack([current, add])
+            chain_entities.append(entity)
+
+    if current is not None and len(current) > 0:
+        chains.append((current, chain_entities))
+
+    contours = []
+    for idx, (pts, ents) in enumerate(chains):
+        types = [e.dxftype() for e in ents]
+        single_circle = len(ents) == 1 and ents[0].dxftype() == "CIRCLE"
+        single_full_ellipse = False
+        if len(ents) == 1 and ents[0].dxftype() == "ELLIPSE":
+            span = abs(ents[0].dxf.end_param - ents[0].dxf.start_param)
+            single_full_ellipse = span >= 2 * math.pi * 0.95
+        closed = _infer_chain_closed(pts, spacing, gap_threshold, single_circle, single_full_ellipse)
+        label = "+".join(types) if len(types) <= 3 else f"CHAIN[{len(types)}]"
+        contours.append(_contour_dict(pts, closed, label, idx, source="entity_order"))
+
+    return contours
+
+
+def split_flat_polyline_by_gap(points, spacing, k_multiplier=5.0, absolute_min_mm=None):
+    """
+    Diagnostic: split when **consecutive** point distance exceeds threshold.
+    Prefer `generate_contours_from_dxf` (entity-order merge) for normal DXF input.
+    Do not use this on raw circle polylines: the closing chord can falsely exceed the threshold.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return []
+    abs_min = absolute_min_mm if absolute_min_mm is not None else 0.0
+    threshold = max(spacing * k_multiplier, abs_min, spacing * 3.0)
+    segments = []
+    start = 0
+    for i in range(len(pts) - 1):
+        d = float(np.linalg.norm(pts[i + 1] - pts[i]))
+        if d > threshold:
+            chunk = pts[start : i + 1]
+            if len(chunk) >= 1:
+                seg_idx = len(segments)
+                c = _infer_chain_closed(chunk, spacing, threshold, False, False)
+                segments.append(_contour_dict(chunk.copy(), c, "GAP_SPLIT", seg_idx, source="gap_split"))
+            start = i + 1
+    chunk = pts[start:]
+    if len(chunk) >= 1:
+        seg_idx = len(segments)
+        c = _infer_chain_closed(chunk, spacing, threshold, False, False)
+        segments.append(_contour_dict(chunk.copy(), c, "GAP_SPLIT", seg_idx, source="gap_split"))
+    return segments
+
+
+def generate_points_from_dxf(dxf_file, spacing, gap_multiplier=5.0):
+    """Flat array: all chains concatenated in modelspace order (for gap-split diagnostic)."""
+    contours = generate_contours_from_dxf(dxf_file, spacing, gap_multiplier=gap_multiplier)
+    if not contours:
+        return np.empty((0, 2))
+    return np.vstack([c["points"] for c in contours])
+
+def contour_centroid(points):
+    p = np.asarray(points, dtype=float)
+    if len(p) == 0:
+        return np.zeros(2)
+    return np.mean(p, axis=0)
+
+def order_contours_greedy_nn(contours, start_idx=0):
+    """
+    Order contour groups by greedy nearest-neighbor on centroids (contour-level TSP heuristic).
+    """
+    n = len(contours)
+    if n <= 1:
+        return list(contours)
+    centroids = np.array([contour_centroid(c["points"]) for c in contours])
+    visited = [False] * n
+    order_idx = [start_idx % n]
+    visited[order_idx[0]] = True
+    current = order_idx[0]
+    for _ in range(n - 1):
+        best_j = -1
+        best_d = np.inf
+        for j in range(n):
+            if visited[j]:
+                continue
+            d = np.sum((centroids[j] - centroids[current]) ** 2)
+            if d < best_d:
+                best_d = d
+                best_j = j
+        visited[best_j] = True
+        order_idx.append(best_j)
+        current = best_j
+    return [contours[i] for i in order_idx]
+
+def nearest_vertex_index(exit_pt, pts):
+    p = np.asarray(pts, dtype=float)
+    if len(p) == 0:
         return 0
+    d2 = np.sum((p - np.asarray(exit_pt, dtype=float)) ** 2, axis=1)
+    return int(np.argmin(d2))
 
-    # Time to accelerate to max velocity
-    time_to_max_velocity = max_velocity / max_acceleration
+def rotate_contour_to_entry(pts, closed, prev_exit):
+    """
+    Orient contour so cutting starts at the best entry from prev_exit.
+    Closed: rotate so nearest vertex is first.
+    Open: reverse so the nearer endpoint is first (cut along polyline direction).
+    """
+    p = np.asarray(pts, dtype=float)
+    if len(p) == 0 or prev_exit is None:
+        return p
+    prev_exit = np.asarray(prev_exit, dtype=float)
+    if closed:
+        j = nearest_vertex_index(prev_exit, p)
+        return np.vstack([p[j:], p[:j]])
+    d0 = np.sum((p[0] - prev_exit) ** 2)
+    d1 = np.sum((p[-1] - prev_exit) ** 2)
+    if d1 < d0:
+        return np.flipud(p).copy()
+    return p
 
-    # Distance covered during acceleration (using s = (1/2) * a * t^2)
-    distance_accel = 0.5 * max_acceleration * (time_to_max_velocity ** 2)
-
-    if distance <= 2 * distance_accel:  # If the distance is less than twice the acceleration distance
-
-        # Calculate time using kinematic equation: t = sqrt(2 * distance / acceleration)
-        time_to_move = np.sqrt(2 * distance / max_acceleration)
+def apply_overlap_closed(pts, closed, overlap_count=0, overlap_fraction=0.0):
+    """
+    For closed contours, append the first N vertices again to overlap the laser path.
+    overlap_count takes precedence if > 0; else overlap_fraction in (0,1] sets N = floor(fraction * len).
+    """
+    p = np.asarray(pts, dtype=float)
+    if not closed or len(p) < 2:
+        return p
+    if overlap_count > 0:
+        n_extra = min(overlap_count, len(p))
+    elif overlap_fraction > 0:
+        n_extra = max(1, int(len(p) * overlap_fraction))
+        n_extra = min(n_extra, len(p))
     else:
-        # Time to accelerate, then constant speed, then decelerate
-        distance_at_max_velocity = distance - 2 * distance_accel
-        time_at_max_velocity = distance_at_max_velocity / max_velocity
-        time_to_move = 2 * time_to_max_velocity + time_at_max_velocity
+        return p
+    return np.vstack([p, p[:n_extra]])
 
-    return time_to_move
+def interpolate_line_2d(a, b, spacing):
+    """Polyline from a to b with approximate spacing (at least 2 points)."""
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    dist = np.linalg.norm(b - a)
+    if dist < 1e-12:
+        return np.vstack([a, b])
+    n = max(2, int(dist / spacing))
+    t = np.linspace(0.0, 1.0, n)
+    xs = a[0] + t * (b[0] - a[0])
+    ys = a[1] + t * (b[1] - a[1])
+    return np.column_stack([xs, ys])
 
-# Function to compute cumulative time and velocity for all points
-def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
-    """Compute cumulative time and velocity for each point ensuring smooth velocity transitions."""
-    relative_times = [0]
-    horizontal_velocities = [0]  # Start with zero velocity for the first point
-    vertical_velocities = [0]    # Start with zero velocity for the first point
 
-    # Ensure the first point starts with (0,0) velocity
-    for i in range(1, len(points)):
-        p1, p2 = np.array(points[i - 1]), np.array(points[i])
-        dist = np.linalg.norm(p2 - p1)
+def travel_polyline_between(prev_exit, entry, spacing, dense=True):
+    """
+    Points for a rapid move from prev_exit to entry (between contours).
 
-        time_needed = calculate_time_to_move(dist, max_velocity, max_acceleration)
+    dense=True: sample along the segment at ~`spacing` (many rows for long jumps — matches
+      cut sampling density; smoother PVT).
+    dense=False: only endpoints (2 points if distinct) — far fewer rows; motion planner still
+      gets one straight segment (velocity profile may be harsher).
+    """
+    a = np.asarray(prev_exit, dtype=float).reshape(2)
+    b = np.asarray(entry, dtype=float).reshape(2)
+    if np.linalg.norm(b - a) < 1e-12:
+        return np.empty((0, 2))
+    if dense:
+        return interpolate_line_2d(a, b, spacing)
+    return np.vstack([a, b])
 
-        # Calculate velocities in both directions
-        horizontal_velocity = (p2[0] - p1[0]) / time_needed
-        vertical_velocity = (p2[1] - p1[1]) / time_needed
 
-        # Append time and velocity for the current step
-        relative_times.append(time_needed) #time in msec
-        horizontal_velocities.append(horizontal_velocity)
-        vertical_velocities.append(vertical_velocity)
+def dedupe_consecutive_points(points, is_cut, eps_mm):
+    """
+    Drop consecutive rows that represent the same location (stitch duplicates, float noise).
+    When merging two rows, keep is_cut = (logical or) so a travel|cut junction becomes cut.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return pts, is_cut
+    ic = np.asarray(is_cut, dtype=bool)
+    out_p = [pts[0]]
+    out_c = [ic[0]]
+    for i in range(1, len(pts)):
+        if float(np.linalg.norm(pts[i] - out_p[-1])) < eps_mm:
+            out_c[-1] = out_c[-1] or ic[i]
+            continue
+        out_p.append(pts[i])
+        out_c.append(ic[i])
+    return np.array(out_p, dtype=float), np.array(out_c, dtype=bool)
 
-    return relative_times, horizontal_velocities, vertical_velocities
 
-# Function to compute the path traversal in counter-clockwise direction
+def build_cutting_path_with_bridges(
+    contours_ordered,
+    spacing,
+    overlap_count=0,
+    overlap_fraction=0.0,
+    dense_travel=True,
+):
+    """
+    Concatenate contours with travel segments between them.
+    For each contour after the first: rotate so nearest entry to previous exit is first,
+    insert interpolated travel (not cut), then emit cut points (with overlap on closed).
+    Returns (points_Nx2, is_cut_bool_1d).
+
+    Point count vs raw DXF interpolation: entity samples are unchanged. Extra rows come from
+    (1) travel between contours — many if dense_travel (~distance/spacing per gap), or 2 per
+    gap if dense_travel=False; (2) overlap on closed contours if enabled.
+    """
+    # Same-location stitches (travel end == next cut start) must merge; float noise handled too.
+    junction_eps_mm = max(1e-6, float(spacing) * 1e-4)
+
+    chunks_pts = []
+    chunks_cut = []
+    prev_exit = None
+
+    for idx, c in enumerate(contours_ordered):
+        pts = np.asarray(c["points"], dtype=float)
+        closed = bool(c["closed"])
+        if len(pts) == 0:
+            continue
+
+        if idx > 0:
+            pts = rotate_contour_to_entry(pts, closed, prev_exit)
+            travel = travel_polyline_between(prev_exit, pts[0], spacing, dense=dense_travel)
+            if len(travel) > 0 and np.allclose(travel[0], prev_exit, atol=junction_eps_mm):
+                travel = travel[1:]
+            # Travel ends at pts[0]; cut_pts will start at pts[0] — drop duplicate endpoint on travel.
+            if len(travel) > 0 and np.allclose(travel[-1], pts[0], atol=junction_eps_mm):
+                travel = travel[:-1]
+            if len(travel) > 0:
+                chunks_pts.append(travel)
+                chunks_cut.append(np.zeros(len(travel), dtype=bool))
+
+        cut_pts = apply_overlap_closed(pts, closed, overlap_count, overlap_fraction)
+        chunks_pts.append(cut_pts)
+        chunks_cut.append(np.ones(len(cut_pts), dtype=bool))
+        prev_exit = cut_pts[-1]
+
+    if not chunks_pts:
+        return np.empty((0, 2)), np.empty(0, dtype=bool)
+    points = np.vstack(chunks_pts)
+    is_cut = np.concatenate(chunks_cut)
+    points, is_cut = dedupe_consecutive_points(points, is_cut, junction_eps_mm)
+    return points, is_cut
+
 def optimize_path(points):
-    """Reorders points using a Nearest Neighbor heuristic for optimal path traversal."""
-
-    # Compute centroid (center of mass)
+    """
+    Legacy: global reorder (angle sort + NN). Prefer build_cutting_path_with_bridges on contours
+    for multi-contour jobs so closed loops and bridging are preserved.
+    """
+    if len(points) == 0:
+        return points
     centroid = np.mean(points, axis=0)
-    
-    # Compute angles from the centroid to the points
     angles = np.arctan2(points[:, 1] - centroid[1], points[:, 0] - centroid[0])
-    
-    # Sort points based on the angle to get a counter-clockwise order
     sorted_points = points[np.argsort(angles)]
-
-    # Nearest Neighbor optimization on the counter-clockwise sorted path
     tree = KDTree(sorted_points)
     num_points = len(sorted_points)
     visited = np.zeros(num_points, dtype=bool)
     optimized_order = []
-
-    # Start at the first point
     current_idx = 0
     for _ in range(num_points):
         optimized_order.append(current_idx)
         visited[current_idx] = True
-
-        # Find the nearest unvisited point
         remaining_points = np.where(~visited)[0]
         if len(remaining_points) == 0:
             break
-
-        distances, indices = tree.query(sorted_points[current_idx], k=len(sorted_points))
+        _, indices = tree.query(sorted_points[current_idx], k=len(sorted_points))
         for idx in indices:
             if not visited[idx]:
                 current_idx = idx
                 break
-
     return sorted_points[optimized_order]
 
-# Function to generate the CSV
-def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration):
-    """Generates a CSV file with Axis 1 and Axis 2 positions and velocities.""" 
-    
-    # Remove duplicate XY points within fuzz distance
-    fuzz = 0.001  # Specify the fuzz distance (in mm)
-    unique_points = remove_close_points(points, fuzz)
+def remove_close_points(points, fuzz):
+    """Removes points that are within 'fuzz' distance of each other."""
+    unique_points = []
+    for i, point in enumerate(points):
+        if not any(np.linalg.norm(point - p) < fuzz for p in unique_points):
+            unique_points.append(point)
+    return np.array(unique_points)
 
-    # Compute time and velocity for unique points
-    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(unique_points, max_velocity, max_acceleration)
+def calculate_time_to_move(distance, max_velocity, max_acceleration):
+    """Calculate the time to move a given distance considering max velocity and max acceleration."""
+    if distance == 0:
+        return 0
+    time_to_max_velocity = max_velocity / max_acceleration
+    distance_accel = 0.5 * max_acceleration * (time_to_max_velocity ** 2)
+    if distance <= 2 * distance_accel:
+        time_to_move = np.sqrt(2 * distance / max_acceleration)
+    else:
+        distance_at_max_velocity = distance - 2 * distance_accel
+        time_at_max_velocity = distance_at_max_velocity / max_velocity
+        time_to_move = 2 * time_to_max_velocity + time_at_max_velocity
+    return time_to_move
 
-    # Make the moves relative (i.e., subtract the first data point from all data points in X and Y, then subtract n-1th point from nth)
-    unique_points[:,0] = unique_points[:,0] - unique_points[0,0]
-    unique_points[:,1] = unique_points[:,1] - unique_points[0,1]
+def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
+    """Compute cumulative time and velocity for each point ensuring smooth velocity transitions."""
+    relative_times = [0]
+    horizontal_velocities = [0]
+    vertical_velocities = [0]
+    min_segment_time_s = 1e-6  # avoid div by zero when dist ~= 0 after dedup / float noise
+    for i in range(1, len(points)):
+        p1, p2 = np.array(points[i - 1]), np.array(points[i])
+        dist = float(np.linalg.norm(p2 - p1))
+        time_needed = calculate_time_to_move(dist, max_velocity, max_acceleration)
+        if dist < 1e-15 or time_needed <= 0 or not np.isfinite(time_needed):
+            time_needed = min_segment_time_s
+            horizontal_velocity = 0.0
+            vertical_velocity = 0.0
+        else:
+            horizontal_velocity = (p2[0] - p1[0]) / time_needed
+            vertical_velocity = (p2[1] - p1[1]) / time_needed
+        relative_times.append(time_needed)
+        horizontal_velocities.append(horizontal_velocity)
+        vertical_velocities.append(vertical_velocity)
+    return relative_times, horizontal_velocities, vertical_velocities
+
+def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration, is_cut=None):
+    """Generates CSV with positions and velocities; optional Cut column (1=cut, 0=travel)."""
+    fuzz = 0.001
+    points = np.asarray(points, dtype=float)
+    if is_cut is None:
+        unique_points = remove_close_points(points, fuzz)
+        is_cut_u = None
+    else:
+        is_cut = np.asarray(is_cut, dtype=bool)
+        unique_pts = []
+        cut_flags = []
+        for i, pt in enumerate(points):
+            if not unique_pts:
+                unique_pts.append(pt.copy())
+                cut_flags.append(is_cut[i])
+                continue
+            if any(np.linalg.norm(pt - p) < fuzz for p in unique_pts):
+                continue
+            unique_pts.append(pt.copy())
+            cut_flags.append(is_cut[i])
+        unique_points = np.array(unique_pts)
+        is_cut_u = np.array(cut_flags, dtype=bool)
+
+    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(
+        unique_points, max_velocity, max_acceleration
+    )
+
+    unique_points = unique_points.copy()
+    unique_points[:, 0] = unique_points[:, 0] - unique_points[0, 0]
+    unique_points[:, 1] = unique_points[:, 1] - unique_points[0, 1]
     first_point = unique_points[0:1]
     deltas = np.diff(unique_points, axis=0)
     rel_points = np.vstack([first_point, deltas])
 
-    # Create DataFrame with the required data in the specified order
     pvt_data = {
         "Time (s)": times,
         "Horizontal position (mm)": rel_points[:, 0],
         "Horizontal velocity (mm/s)": horizontal_velocities,
         "Vertical position (mm)": rel_points[:, 1],
-        "Vertical velocity (mm/s)": vertical_velocities
+        "Vertical velocity (mm/s)": vertical_velocities,
     }
-    
-    pvt_df = pd.DataFrame(pvt_data)
+    if is_cut_u is not None and len(is_cut_u) == len(unique_points):
+        pvt_data["Cut (1=cut 0=travel)"] = is_cut_u.astype(int)
 
-    # Save to CSV
+    pvt_df = pd.DataFrame(pvt_data)
     pvt_df.to_csv(output_filename, index=False)
     print(f"✅ CSV file saved to {output_filename}")
 
-# Function to plot optimized path with velocity vectors
-def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_velocities, offset_distance=0.001):
-    """Plots the optimized points with velocity vectors and labels the order of points, offset to the outside.""" 
+def plot_points_with_velocity_vectors(
+    points, horizontal_velocities, vertical_velocities, offset_distance=0.001, save_path=None
+):
+    """Plots the path with velocity vectors and point order labels.
+
+    Uses blocking show() so the window stays until you close it (VS / some hosts
+    otherwise exit and the figure disappears). If save_path is set, also writes a PNG.
+    """
+    plt.ioff()
     num_points = len(points)
-
-    # Compute centroid (center of mass)
     centroid = np.mean(points, axis=0)
-
-    # Create a plot with both points and velocity vectors
     plt.figure(figsize=(10, 6))
-    
-    # Plot the path
     plt.plot(points[:, 0], points[:, 1], color='blue', marker='o', markersize=4, label='Path')
-
-    # Plot velocity vectors
-    plt.quiver(points[:, 0], points[:, 1], horizontal_velocities, vertical_velocities, angles='xy', scale_units='xy', scale=0.1, color='red', label='Velocity Vectors')
-
-    # Label each point with its order in the sequence, offset to the outside of the path
+    plt.quiver(
+        points[:, 0], points[:, 1], horizontal_velocities, vertical_velocities,
+        angles='xy', scale_units='xy', scale=0.1, color='red', label='Velocity Vectors'
+    )
     for i, point in enumerate(points):
-
-        # Calculate direction vector from the centroid to the point
         direction = np.array([point[0] - centroid[0], point[1] - centroid[1]])
-
-        # Normalize the direction vector
-        direction_normalized = direction / np.linalg.norm(direction)
-
-        # Offset the label slightly outside the path
+        direction_normalized = direction / (np.linalg.norm(direction) + 1e-12)
         offset = direction_normalized * offset_distance
-
-        # Apply offset to the label position
-        label_x = point[0] + offset[0]
-        label_y = point[1] + offset[1]
-        
-
-        # Plot the label with an offset
-        plt.text(label_x, label_y, str(i), fontsize=8, color='black', ha='center', va='center')
-
+        plt.text(point[0] + offset[0], point[1] + offset[1], str(i), fontsize=8, color='black', ha='center', va='center')
     plt.xlabel("X Coordinate (mm)")
     plt.ylabel("Y Coordinate (mm)")
-    plt.title("Optimized Path with Velocity Vectors and Point Order")
+    plt.title("Path with Velocity Vectors and Point Order")
     plt.axis("equal")
     plt.legend()
-    plt.show()
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Preview image saved to {save_path}")
+    plt.show(block=True)
+
+def prompt_overlap_settings():
+    """
+    Ask in the terminal how to apply overlap on closed contours.
+    Returns (overlap_count, overlap_fraction).
+    If overlap_count > 0, it wins and overlap_fraction is ignored by apply_overlap_closed.
+    """
+    print()
+    print("--- Laser overlap (closed contours only) ---")
+    print(
+        "After one full pass on a closed loop, the path can repeat the first part of the loop\n"
+        "again so the laser passes over the same region twice (stronger cut).\n"
+        "  • By count: repeat the first N interpolated points (integer ≥ 1).\n"
+        "  • By fraction: repeat the first (fraction × loop length) points, e.g. 0.05 = 5%.\n"
+        "If you enter a count > 0, the fraction is ignored.\n"
+    )
+    overlap_count = 0
+    overlap_fraction = 0.0
+
+    ans = input("Add overlap on closed contours? [y/N]: ").strip().lower()
+    if ans not in ("y", "yes"):
+        print("Overlap disabled.\n")
+        return overlap_count, overlap_fraction
+
+    mode = input("Use (c)ount of points or (f)raction of loop? [c/f, default f]: ").strip().lower()
+    if mode in ("c", "count"):
+        while True:
+            raw = input("Number of points to repeat from the start of each closed loop [e.g. 10]: ").strip()
+            try:
+                overlap_count = int(raw)
+                if overlap_count < 1:
+                    print("Enter a positive integer, or 0 to cancel count mode.")
+                    continue
+                print(f"Using overlap_count = {overlap_count} (fraction ignored).\n")
+                return overlap_count, 0.0
+            except ValueError:
+                print("Invalid integer; try again.")
+    else:
+        while True:
+            raw = input("Fraction of each closed loop to repeat [0–1, default 0.05]: ").strip()
+            if not raw:
+                overlap_fraction = 0.05
+                break
+            try:
+                overlap_fraction = float(raw)
+                if overlap_fraction <= 0 or overlap_fraction > 1:
+                    print("Enter a number between 0 and 1 (e.g. 0.05 for 5%).")
+                    continue
+                break
+            except ValueError:
+                print("Invalid number; try again.")
+        print(f"Using overlap_fraction = {overlap_fraction}\n")
+        return 0, overlap_fraction
+
+
+def prompt_dense_travel():
+    """True = sample each travel segment at full spacing (more PVT rows). False = endpoints only."""
+    print()
+    print(
+        "Travel between contours: 'dense' samples the rapid move at the same spacing as the cut\n"
+        "(many points on long jumps). 'Sparse' uses only segment endpoints (fewer rows).\n"
+    )
+    ans = input("Use dense travel sampling? [Y/n]: ").strip().lower()
+    return ans not in ("n", "no")
+
+
+def prompt_gap_split_mode():
+    """
+    Optional diagnostic path: split a flat merged polyline by gap threshold instead of
+    using per-entity contours from the DXF (see split_flat_polyline_by_gap).
+    """
+    print()
+    ans = input(
+        "Contour mode: (e)ntity-based from DXF [default], or (g)ap-split on merged point list? [e/g]: "
+    ).strip().lower()
+    return ans in ("g", "gap", "gap-split")
+
 
 if __name__ == '__main__':
-    dxf_file = "SingleChipUpperLung.dxf"  # Path to your DXF file
-    spacing = 0.01  # Spacing between points (in mm)
-    max_velocity = 100  # Max velocity (in mm/sec)
-    max_acceleration = 5000  # Max acceleration (in mm/s^2)
+    dxf_file = input("Path to DXF file [SingleChipUpperLung.dxf]: ").strip() or "SingleChipUpperLung.dxf"
+    spacing = 0.01
+    max_velocity = 100
+    max_acceleration = 5000
 
-    # Extract points from the DXF using the generate_points_from_dxf function
-    extracted_points = generate_points_from_dxf(dxf_file, spacing)
+    dxf_resolved = resolve_dxf_path(dxf_file)
 
-    # Optimize path traversal in counter-clockwise direction
-    optimized_points = optimize_path(extracted_points)
- 
-    # Compute time and velocity for optimized path
-    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
+    if prompt_gap_split_mode():
+        flat = generate_points_from_dxf(dxf_resolved, spacing)
+        contours = split_flat_polyline_by_gap(flat, spacing, k_multiplier=5.0)
+        print(f"Gap-split produced {len(contours)} segment(s) from merged polyline.\n")
+    else:
+        contours = generate_contours_from_dxf(dxf_resolved, spacing)
 
-    # Generate the CSV output (with duplicates removed)
-    output_csv = dxf_file.replace(".dxf", "_pvt.csv")
-    generate_csv_from_points(optimized_points, output_csv, max_velocity, max_acceleration)
+    if not contours:
+        print("No contours extracted; exiting.")
+        raise SystemExit(1)
 
-    # Plot the optimized path with velocity vectors
-    plot_points_with_velocity_vectors(optimized_points, horizontal_velocities, vertical_velocities)
+    contours_ordered = order_contours_greedy_nn(contours, start_idx=0)
+
+    overlap_count, overlap_fraction = prompt_overlap_settings()
+
+    dense_travel = prompt_dense_travel()
+
+    optimized_points, is_cut = build_cutting_path_with_bridges(
+        contours_ordered,
+        spacing,
+        overlap_count=overlap_count,
+        overlap_fraction=overlap_fraction,
+        dense_travel=dense_travel,
+    )
+
+    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(
+        optimized_points, max_velocity, max_acceleration
+    )
+
+    output_csv = os.path.splitext(dxf_resolved)[0] + "_pvt.csv"
+    generate_csv_from_points(
+        optimized_points, output_csv, max_velocity, max_acceleration, is_cut=is_cut
+    )
+
+    preview_png = os.path.splitext(dxf_resolved)[0] + "_preview.png"
+    plot_points_with_velocity_vectors(
+        optimized_points, horizontal_velocities, vertical_velocities, save_path=preview_png
+    )
