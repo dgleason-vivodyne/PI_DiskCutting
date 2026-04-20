@@ -227,9 +227,15 @@ def contour_centroid(points):
         return np.zeros(2)
     return np.mean(p, axis=0)
 
+def order_contours_preserve_dxf(contours):
+    """Keep contours in the order returned by `generate_contours_from_dxf` (modelspace chain order)."""
+    return list(contours)
+
+
 def order_contours_greedy_nn(contours, start_idx=0):
     """
     Order contour groups by greedy nearest-neighbor on centroids (contour-level TSP heuristic).
+    Can visit shapes in a different order than the DXF; straight-line travel may then cross uncut areas.
     """
     n = len(contours)
     if n <= 1:
@@ -640,6 +646,26 @@ def prompt_dense_travel():
     return ans not in ("n", "no")
 
 
+def prompt_contour_visit_order():
+    """
+    Returns True for greedy nearest-centroid order, False to keep DXF chain order (default).
+    """
+    print()
+    print(
+        "Contour visit order (which shape to cut first, second, …):\n"
+        "  (d) Preserve DXF / chain order [default] — finish each contour in file order; most\n"
+        "      predictable and usually closest to “complete one shape, then the next.”\n"
+        "  (n) Nearest centroids (greedy) — can shorten travel, but may reorder shapes so straight\n"
+        "      travel crosses uncut areas.\n"
+    )
+    ans = input("Contour order [D/n]: ").strip().lower()
+    if ans in ("n", "nearest", "greedy", "nn"):
+        print("Using greedy nearest-centroid order between contours.\n")
+        return True
+    print("Preserving DXF order between contours.\n")
+    return False
+
+
 def prompt_gap_split_mode():
     """
     Optional diagnostic path: split a flat merged polyline by gap threshold instead of
@@ -672,13 +698,16 @@ if __name__ == '__main__':
         print("No contours extracted; exiting.")
         raise SystemExit(1)
 
-    contours_ordered = order_contours_greedy_nn(contours, start_idx=0)
+    if prompt_contour_visit_order():
+        contours_ordered = order_contours_greedy_nn(contours, start_idx=0)
+    else:
+        contours_ordered = order_contours_preserve_dxf(contours)
 
     overlap_count, overlap_fraction = prompt_overlap_settings()
 
     dense_travel = prompt_dense_travel()
 
-    optimized_points, is_cut = build_cutting_path_with_bridges(
+    optimized_points = build_cutting_path_with_bridges(
         contours_ordered,
         spacing,
         overlap_count=overlap_count,
