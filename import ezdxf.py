@@ -254,35 +254,64 @@ def order_contours_greedy_nn(contours, start_idx=0):
         current = best_j
     return [contours[i] for i in order_idx]
 
-def nearest_vertex_index(exit_pt, pts):
-    p = np.asarray(pts, dtype=float)
-    if len(p) == 0:
-        return 0
-    d2 = np.sum((p - np.asarray(exit_pt, dtype=float)) ** 2, axis=1)
-    return int(np.argmin(d2))
-
-def rotate_contour_to_entry(pts, closed, prev_exit):
+def optimize_closed_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last):
     """
-    Orient contour so cutting starts at the best entry from prev_exit.
-    Closed: rotate so nearest vertex is first.
-    Open: reverse so the nearer endpoint is first (cut along polyline direction).
+    Cyclic shift on a closed polyline: choose start j so entry p[j] is near the previous cut end
+    and exit p[j-1] is near the next contour. Single-contour jobs leave order unchanged.
     """
     p = np.asarray(pts, dtype=float)
-    if len(p) == 0 or prev_exit is None:
+    n = len(p)
+    if n < 2:
         return p
-    prev_exit = np.asarray(prev_exit, dtype=float)
-    if closed:
-        j = nearest_vertex_index(prev_exit, p)
-        return np.vstack([p[j:], p[:j]])
-    d0 = np.sum((p[0] - prev_exit) ** 2)
-    d1 = np.sum((p[-1] - prev_exit) ** 2)
-    if d1 < d0:
-        return np.flipud(p).copy()
-    return p
+    if is_first and is_last:
+        return p
+    best_j = 0
+    best_cost = np.inf
+    for j in range(n):
+        entry_pt = p[j]
+        exit_pt = p[(j - 1 + n) % n]
+        cost = 0.0
+        if not is_first and prev_exit is not None:
+            pe = np.asarray(prev_exit, dtype=float).reshape(2)
+            cost += float(np.sum((entry_pt - pe) ** 2))
+        if not is_last and next_target is not None:
+            nt = np.asarray(next_target, dtype=float).reshape(2)
+            cost += float(np.sum((exit_pt - nt) ** 2))
+        if cost < best_cost:
+            best_cost = cost
+            best_j = j
+    return np.vstack([p[best_j:], p[:best_j]])
+
+
+def orient_open_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last):
+    """Forward vs reverse so start is near previous exit and end near next contour."""
+    p = np.asarray(pts, dtype=float)
+    if len(p) < 2:
+        return p
+    if is_first and is_last:
+        return p
+
+    forward = p
+    backward = np.flipud(p).copy()
+
+    def score(arr):
+        s = 0.0
+        a, b = arr[0], arr[-1]
+        if not is_first and prev_exit is not None:
+            pe = np.asarray(prev_exit, dtype=float).reshape(2)
+            s += float(np.sum((a - pe) ** 2))
+        if not is_last and next_target is not None:
+            nt = np.asarray(next_target, dtype=float).reshape(2)
+            s += float(np.sum((b - nt) ** 2))
+        return s
+
+    return forward if score(forward) <= score(backward) else backward
+
 
 def apply_overlap_closed(pts, closed, overlap_count=0, overlap_fraction=0.0):
     """
-    For closed contours, append the first N vertices again to overlap the laser path.
+    For closed contours, append the last N vertices again to overlap the laser path (tail repeat
+    keeps the final position near the perimeter exit for bridging to the next contour).
     overlap_count takes precedence if > 0; else overlap_fraction in (0,1] sets N = floor(fraction * len).
     """
     p = np.asarray(pts, dtype=float)
