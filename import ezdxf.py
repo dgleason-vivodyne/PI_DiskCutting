@@ -634,7 +634,8 @@ def prompt_gap_split_mode():
 
 
 if __name__ == '__main__':
-    dxf_file = input("Path to DXF file [SingleChipUpperLung.dxf]: ").strip() or "SingleChipUpperLung.dxf"
+    ''' dxf_file = input("Path to DXF file [SingleChipUpperLung.dxf]: ").strip() or "SingleChipUpperLung.dxf" '''
+    dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
     spacing = 0.01
     max_velocity = 100
     max_acceleration = 5000
