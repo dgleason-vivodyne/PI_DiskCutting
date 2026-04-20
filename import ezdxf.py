@@ -1,3 +1,8 @@
+"""
+DXF -> interpolated contours -> contour-order + bridge + overlap -> PVT CSV.
+PI_DiskCutting project. See CSV_DMS_README.txt for PVT column layout and DMS consumption.
+"""
+import os
 import ezdxf
 import numpy as np
 import pandas as pd
