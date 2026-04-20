@@ -6,7 +6,7 @@ from scipy.spatial import KDTree
 import math
 
 # Cut paths: only entities on layers that are **on** in the LAYER table. Layer "Startpoints" is
-# excluded from interpolation (reserved for a future feature: start/seam hints for visible layers).
+# excluded from cut geometry; CIRCLEs on Startpoints are used only as seam/start markers.
 _EXCLUDED_LAYER_NAME = "Startpoints"
 
 
@@ -21,7 +21,109 @@ def _entity_layer_processed(doc, entity) -> bool:
         return True
     return doc.layers.get(name).is_on()
 
-# Interpolation functions 
+
+def _is_startpoints_layer_name(entity) -> bool:
+    return str(getattr(entity.dxf, "layer", "") or "").strip().lower() == _EXCLUDED_LAYER_NAME.lower()
+
+
+def collect_startpoint_circle_centers(doc) -> np.ndarray:
+    """CIRCLE entities on layer Startpoints: centers used to pick seam start on each cut contour."""
+    centers = []
+    for entity in doc.modelspace():
+        if entity.dxftype() != "CIRCLE":
+            continue
+        if not _is_startpoints_layer_name(entity):
+            continue
+        centers.append((float(entity.dxf.center.x), float(entity.dxf.center.y)))
+    if not centers:
+        return np.empty((0, 2), dtype=float)
+    return np.asarray(centers, dtype=float)
+
+
+def _assign_startpoint_centers_to_contours(contours, centers: np.ndarray):
+    """
+    Greedy 1:1 match in contour order: each contour gets the closest unused circle center
+    (minimum distance from center to any vertex of that contour).
+    """
+    if centers is None or len(centers) == 0:
+        return [None] * len(contours)
+    K = len(centers)
+    used = [False] * K
+    out = [None] * len(contours)
+    for i, c in enumerate(contours):
+        pts = np.asarray(c["points"], dtype=float)
+        if len(pts) == 0:
+            continue
+        best_k = None
+        best_d = np.inf
+        for k in range(K):
+            if used[k]:
+                continue
+            cen = centers[k]
+            dmin = float(np.min(np.linalg.norm(pts - cen.reshape(1, 2), axis=1)))
+            if dmin < best_d:
+                best_d = dmin
+                best_k = k
+        if best_k is not None:
+            used[best_k] = True
+            out[i] = np.asarray(centers[best_k], dtype=float).copy()
+    return out
+
+
+def rotate_polyline_start_at_closest_vertex(pts: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """Closed contours only: cyclic shift so the vertex nearest ``center`` is first (preserves edge adjacency)."""
+    p = np.asarray(pts, dtype=float)
+    n = len(p)
+    if n < 2:
+        return p
+    cen = np.asarray(center, dtype=float).reshape(2)
+    d2 = np.sum((p - cen) ** 2, axis=1)
+    k = int(np.argmin(d2))
+    return np.vstack([p[k:], p[:k]])
+
+
+def orient_open_polyline_toward_startpoint(pts: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """
+    Open contours: cannot cyclic-shift without a bogus jump (last vertex would connect to first).
+    Choose traversal direction so the **endpoint** nearer to ``center`` is the start of the path
+    (reverse the vertex list if needed).
+    """
+    p = np.asarray(pts, dtype=float)
+    if len(p) < 2:
+        return p
+    cen = np.asarray(center, dtype=float).reshape(2)
+    d0 = float(np.sum((p[0] - cen) ** 2))
+    d1 = float(np.sum((p[-1] - cen) ** 2))
+    if d1 < d0:
+        return np.flipud(p).copy()
+    return p.copy()
+
+
+def apply_startpoint_seam_rotations(doc, contours) -> bool:
+    """Match Startpoints circles to contours; reorder seam start (closed = cyclic shift, open = maybe reverse)."""
+    centers = collect_startpoint_circle_centers(doc)
+    if len(centers) == 0:
+        return False
+    assigned = _assign_startpoint_centers_to_contours(contours, centers)
+    did_any = False
+    for c, cen in zip(contours, assigned):
+        if cen is None:
+            continue
+        pts = np.asarray(c["points"], dtype=float)
+        if len(pts) < 2:
+            continue
+        closed = bool(c.get("closed", False))
+        if closed:
+            new_pts = rotate_polyline_start_at_closest_vertex(pts, cen)
+        else:
+            new_pts = orient_open_polyline_toward_startpoint(pts, cen)
+        c["points"] = new_pts
+        c["startpoint_rotated"] = True
+        did_any = True
+    return did_any
+
+
+# Interpolation functions
 def interpolate_arc(center, radius, start_angle, end_angle, spacing):
     """Interpolates points along an arc with equal spacing."""
     start_angle = np.radians(start_angle)
