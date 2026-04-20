@@ -140,6 +140,7 @@ def interpolate_arc(center, radius, start_angle, end_angle, spacing):
 
     return arc_points
 
+
 def interpolate_circle(center, radius, spacing):
     """Interpolates points along a full circle with equal spacing."""
     circumference = 2 * np.pi * radius
@@ -358,6 +359,7 @@ def dedupe_consecutive_points(points, eps_mm):
             out.append(pts[i])
     return np.array(out, dtype=float)
 
+
 # Function to compute time based on max velocity and max acceleration
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
     """Calculate the time to move a given distance considering max velocity and max acceleration."""
@@ -381,6 +383,7 @@ def calculate_time_to_move(distance, max_velocity, max_acceleration):
         time_to_move = 2 * time_to_max_velocity + time_at_max_velocity
 
     return time_to_move
+
 
 # Function to compute cumulative time and velocity for all points
 def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
@@ -411,16 +414,17 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
 
     return relative_times, horizontal_velocities, vertical_velocities
 
+
 # Function to compute the path traversal in counter-clockwise direction
 def optimize_path(points):
     """Reorders points using a Nearest Neighbor heuristic for optimal path traversal."""
 
     # Compute centroid (center of mass)
     centroid = np.mean(points, axis=0)
-    
+
     # Compute angles from the centroid to the points
     angles = np.arctan2(points[:, 1] - centroid[1], points[:, 0] - centroid[0])
-    
+
     # Sort points based on the angle to get a counter-clockwise order
     sorted_points = points[np.argsort(angles)]
 
@@ -449,10 +453,11 @@ def optimize_path(points):
 
     return sorted_points[optimized_order]
 
+
 # Function to generate the CSV
 def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration):
-    """Generates a CSV file with Axis 1 and Axis 2 positions and velocities.""" 
-    
+    """Generates a CSV file with Axis 1 and Axis 2 positions and velocities."""
+
     # Collapse consecutive duplicate XY only (overlap retraces preserved)
     fuzz = 0.001  # Specify the fuzz distance (in mm)
     unique_points = dedupe_consecutive_points(points, fuzz)
@@ -475,16 +480,17 @@ def generate_csv_from_points(points, output_filename, max_velocity, max_accelera
         "Vertical position (mm)": rel_points[:, 1],
         "Vertical velocity (mm/s)": vertical_velocities
     }
-    
+
     pvt_df = pd.DataFrame(pvt_data)
 
     # Save to CSV
     pvt_df.to_csv(output_filename, index=False)
     print(f"✅ CSV file saved to {output_filename}")
 
+
 # Function to plot optimized path with velocity vectors
 def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_velocities, offset_distance=0.001):
-    """Plots the optimized points with velocity vectors and labels the order of points, offset to the outside.""" 
+    """Plots the optimized points with velocity vectors and labels the order of points, offset to the outside."""
     num_points = len(points)
 
     # Compute centroid (center of mass)
@@ -492,7 +498,7 @@ def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_ve
 
     # Create a plot with both points and velocity vectors
     plt.figure(figsize=(10, 6))
-    
+
     # Plot the path
     plt.plot(points[:, 0], points[:, 1], color='blue', marker='o', markersize=4, label='Path')
 
@@ -514,7 +520,7 @@ def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_ve
         # Apply offset to the label position
         label_x = point[0] + offset[0]
         label_y = point[1] + offset[1]
-        
+
 
         # Plot the label with an offset
         plt.text(label_x, label_y, str(i), fontsize=8, color='black', ha='center', va='center')
