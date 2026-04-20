@@ -150,83 +150,202 @@ def interpolate_circle(center, radius, spacing):
 
     return circle_points
 
+
 def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, spacing):
     """Interpolates points along an ellipse with equal spacing."""
     angles = np.linspace(start_param, end_param, int(2 * np.pi * max(major_axis, minor_axis) / (5 * spacing)))
     ellipse_points = [(center[0] + np.cos(a) * major_axis, center[1] + np.sin(a) * minor_axis) for a in angles]
     return ellipse_points
 
-def generate_points_from_dxf(dxf_file, spacing):
-    """Extracts points from DXF LINE, ARC, CIRCLE, ELLIPSE on layers that are on; skips Startpoints."""
-    dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
-    doc = ezdxf.readfile(dxf_file)
-    msp = doc.modelspace()
-    points = []
 
-    # Process LINE entities
-    for entity in msp.query("LINE"):
-        if not _entity_layer_processed(doc, entity):
-            continue
-        start_point = np.array((entity.dxf.start.x, entity.dxf.start.y))
-        end_point = np.array((entity.dxf.end.x, entity.dxf.end.y))
-        distance = np.linalg.norm(end_point - start_point)
-        num_points = max(2, int(distance / spacing))
-
-        segment_points = np.linspace(start_point, end_point, num_points)
-        points.extend(segment_points)
-
-    # Process ARC entities
-    for entity in msp.query("ARC"):
-        if not _entity_layer_processed(doc, entity):
-            continue
+def interpolate_entity_xy(entity, spacing):
+    """Sample one LINE/ARC/CIRCLE/ELLIPSE to a polyline in WCS (mm)."""
+    dt = entity.dxftype()
+    if dt == "LINE":
+        start_point = np.array((entity.dxf.start.x, entity.dxf.start.y), dtype=float)
+        end_point = np.array((entity.dxf.end.x, entity.dxf.end.y), dtype=float)
+        dist = np.linalg.norm(end_point - start_point)
+        n = max(2, int(dist / spacing))
+        return np.linspace(start_point, end_point, n)
+    if dt == "ARC":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        radius = entity.dxf.radius
-        start_angle = entity.dxf.start_angle
-        end_angle = entity.dxf.end_angle
-
-        arc_points = interpolate_arc(center, radius, start_angle, end_angle, spacing)
-        points.extend(arc_points)
-
-    # Process CIRCLE entities
-    for entity in msp.query("CIRCLE"):
-        if not _entity_layer_processed(doc, entity):
-            continue
+        arc_pts = interpolate_arc(center, entity.dxf.radius, entity.dxf.start_angle, entity.dxf.end_angle, spacing)
+        return np.array(arc_pts, dtype=float)
+    if dt == "CIRCLE":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        radius = entity.dxf.radius
-
-        circle_points = interpolate_circle(center, radius, spacing)
-        points.extend(circle_points)
-
-    # Process ELLIPSE entities
-    for entity in msp.query("ELLIPSE"):
-        if not _entity_layer_processed(doc, entity):
-            continue
+        circ_pts = interpolate_circle(center, entity.dxf.radius, spacing)
+        return np.array(circ_pts, dtype=float)
+    if dt == "ELLIPSE":
         center = (entity.dxf.center.x, entity.dxf.center.y)
-        major_axis = entity.dxf.major_axis.magnitude  # No division by 2
-        minor_axis = major_axis * entity.dxf.ratio  # Calculate the semi-minor axis using the ratio
-        start_param = entity.dxf.start_param
-        end_param = entity.dxf.end_param
-
-        # Interpolate ellipse points
-        ellipse_points = interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, spacing)
-
-        # Rotate ellipse points 90 degrees clockwise about the center point
-        rotated_ellipse_points = []
+        major_axis = entity.dxf.major_axis.magnitude
+        minor_axis = major_axis * entity.dxf.ratio
+        ellipse_points = interpolate_ellipse(
+            center, major_axis, minor_axis, entity.dxf.start_param, entity.dxf.end_param, spacing
+        )
+        rotated = []
         for (x, y) in ellipse_points:
-            # Translate points to origin
-            x_shifted = x - center[0]
-            y_shifted = y - center[1]
+            x_shifted, y_shifted = x - center[0], y - center[1]
+            rotated.append((-y_shifted + center[0], x_shifted + center[1]))
+        return np.array(rotated, dtype=float)
+    return None
 
-            # Rotate 90 degrees clockwise: (x', y') = (y, -x)
-            x_rotated = -y_shifted
-            y_rotated = x_shifted
 
-            # Translate back to the original center
-            rotated_ellipse_points.append((x_rotated + center[0], y_rotated + center[1]))
+def _infer_chain_closed(points, spacing, gap_threshold, single_circle, single_full_ellipse):
+    p = np.asarray(points, dtype=float)
+    if len(p) < 3:
+        return False
+    if single_circle:
+        return True
+    if single_full_ellipse:
+        return True
+    d_close = float(np.linalg.norm(p[0] - p[-1]))
+    return d_close <= max(spacing * 3.0, gap_threshold * 0.5)
 
-        points.extend(rotated_ellipse_points)
 
-    return np.array(points)
+def _chord_dense_samples(p0: np.ndarray, p1: np.ndarray, spacing: float) -> np.ndarray:
+    """Straight samples from ``p0`` to ``p1`` at ``spacing`` (exclusive of ``p0``, inclusive of ``p1``)."""
+    p0 = np.asarray(p0, dtype=float).reshape(2)
+    p1 = np.asarray(p1, dtype=float).reshape(2)
+    d = float(np.linalg.norm(p1 - p0))
+    if d <= 1e-12:
+        return np.empty((0, 2))
+    n_steps = max(1, int(np.ceil(d / float(spacing))))
+    t = np.linspace(0.0, 1.0, n_steps + 1)
+    xy = (1.0 - t)[:, None] * p0 + t[:, None] * p1
+    return xy[1:]
+
+
+def _orient_segment_to_follow_chain(raw: np.ndarray, prev_tail: np.ndarray) -> np.ndarray:
+    """
+    Prefer the sample direction whose **start** is closer to ``prev_tail`` (the last chain point).
+    DXF entity order is often draw order, not always head-to-tail along the cut; reversing removes
+    bogus long hops that look like wrong NN order in previews.
+    """
+    r = np.asarray(raw, dtype=float)
+    if len(r) < 2:
+        return r.copy()
+    d_fwd = float(np.linalg.norm(r[0] - prev_tail))
+    d_rev = float(np.linalg.norm(r[-1] - prev_tail))
+    if d_rev < d_fwd - 1e-9:
+        return np.flipud(r)
+    return r.copy()
+
+
+def generate_contours_from_dxf(
+    dxf_path: str,
+    spacing: float,
+    gap_multiplier: float = 5.0,
+    min_stitch_gap_mm: float = 1.0,
+):
+    """
+    Entity-order chains: merge LINE/ARC/CIRCLE/ELLIPSE on allowed layers until gap > threshold.
+    Each new entity is oriented (forward vs reversed) so its start matches the previous tail when
+    possible. Returns a list of dicts: {"points": (N,2) float array}.
+
+    ``min_stitch_gap_mm`` (default 1 mm): CAD endpoints often sit ~0.5–0.7 mm apart on corners; a
+    threshold of only ``gap_multiplier * spacing`` would split outlines and leave long chord hops
+    with no intermediate samples. The effective stitch limit is ``max(gap_multiplier * spacing,
+    min_stitch_gap_mm)``. When two segments join with a non-zero gap, a straight chord is densified
+    to ``spacing`` so previews and PVT steps stay sequential.
+    """
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+    gap_threshold = max(float(gap_multiplier) * float(spacing), float(min_stitch_gap_mm))
+    stitch_eps = max(float(spacing) * 0.25, 1e-9)
+
+    chains = []
+    current = None
+    chain_entities = []
+
+    for entity in msp:
+        dt = entity.dxftype()
+        if dt not in ("LINE", "ARC", "CIRCLE", "ELLIPSE"):
+            continue
+        if not _entity_layer_processed(doc, entity):
+            # Startpoints (seam markers) are not cut geometry; skipping them must NOT break the
+            # current chain — otherwise a marker circle between bean segments splits one outline
+            # into multiple contours and the flat path shows sub-mm "teleports" at vstack joins.
+            if _is_startpoints_layer_name(entity):
+                continue
+            if current is not None and len(current) > 0:
+                chains.append((current, chain_entities))
+                current = None
+                chain_entities = []
+            continue
+        raw = interpolate_entity_xy(entity, spacing)
+        if raw is None or len(raw) == 0:
+            continue
+
+        if current is None:
+            current = np.asarray(raw, dtype=float).copy()
+            chain_entities = [entity]
+            continue
+
+        prev_tail = current[-1]
+        seg = _orient_segment_to_follow_chain(raw, prev_tail)
+        d_joint = float(np.linalg.norm(seg[0] - prev_tail))
+
+        if d_joint > gap_threshold:
+            chains.append((current, chain_entities))
+            current = np.asarray(raw, dtype=float).copy()
+            chain_entities = [entity]
+            continue
+
+        if d_joint < stitch_eps:
+            add = seg[1:] if len(seg) > 1 else np.empty((0, 2))
+        else:
+            chord = _chord_dense_samples(prev_tail, seg[0], spacing)
+            if len(chord) > 0 and len(seg) > 1:
+                add = np.vstack([chord, seg[1:]])
+            elif len(chord) > 0:
+                add = chord
+            else:
+                add = seg
+
+        if len(add) > 0:
+            current = np.vstack([current, add])
+        chain_entities.append(entity)
+
+    if current is not None and len(current) > 0:
+        chains.append((current, chain_entities))
+
+    contours = []
+    for pts, ents in chains:
+        types = [e.dxftype() for e in ents]
+        single_circle = len(ents) == 1 and ents[0].dxftype() == "CIRCLE"
+        single_full_ellipse = False
+        if len(ents) == 1 and ents[0].dxftype() == "ELLIPSE":
+            span = abs(ents[0].dxf.end_param - ents[0].dxf.start_param)
+            single_full_ellipse = span >= 2 * math.pi * 0.95
+        closed = _infer_chain_closed(pts, spacing, gap_threshold, single_circle, single_full_ellipse)
+        contours.append({"points": pts.copy(), "closed": closed, "dxftype": "+".join(types) if len(types) <= 3 else f"CHAIN[{len(types)}]"})
+
+    return doc, contours
+
+
+def generate_points_from_dxf(dxf_file, spacing):
+    """
+    Extract points from DXF: entity-order contours on allowed layers.
+
+    Vertex order along each contour follows stitched LINE/ARC/CIRCLE/ELLIPSE samples; when
+    chaining entities, each segment is **reversed if needed** so its start matches the previous
+    tail (CAD file order is not always head-to-tail). Do **not** run ``optimize_path`` on those points:
+    angle-sort + nearest-neighbor reorders dense samples on a closed curve and produces long
+    chords that zigzag across the interior (looks like non-sequential hops in a preview).
+
+    Startpoints: **closed** contours get a **cyclic shift** so the vertex nearest the marker is
+    first (still one continuous loop). **Open** contours only **reverse** if needed so the nearer
+    **endpoint** is first—cyclic shifts are not used on open polylines (they would add an
+    artificial wrap jump mid-contour). Contours are concatenated in contour order (large moves
+    between separate contours remain).
+    """
+    dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
+    doc, contours = generate_contours_from_dxf(dxf_file, spacing)
+    apply_startpoint_seam_rotations(doc, contours)
+    if not contours:
+        return np.empty((0, 2))
+    return np.vstack([c["points"] for c in contours])
+
 
 def dedupe_consecutive_points(points, eps_mm):
     """Drop consecutive duplicate positions only (keeps overlap retraces that revisit earlier XY)."""
