@@ -5,6 +5,22 @@ import matplotlib.pyplot as plt
 from scipy.spatial import KDTree
 import math
 
+# Cut paths: only entities on layers that are **on** in the LAYER table. Layer "Startpoints" is
+# excluded from interpolation (reserved for a future feature: start/seam hints for visible layers).
+_EXCLUDED_LAYER_NAME = "Startpoints"
+
+
+def _entity_layer_processed(doc, entity) -> bool:
+    """True if entity's layer is on and not the Startpoints layer."""
+    name = str(getattr(entity.dxf, "layer", "") or "").strip()
+    if not name:
+        return False
+    if name.lower() == _EXCLUDED_LAYER_NAME.lower():
+        return False
+    if name not in doc.layers:
+        return True
+    return doc.layers.get(name).is_on()
+
 # Interpolation functions 
 def interpolate_arc(center, radius, start_angle, end_angle, spacing):
     """Interpolates points along an arc with equal spacing."""
