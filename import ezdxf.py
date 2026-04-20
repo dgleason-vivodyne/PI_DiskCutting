@@ -557,11 +557,8 @@ if __name__ == '__main__':
     max_velocity = 100  # Max velocity (in mm/sec)
     max_acceleration = 5000  # Max acceleration (in mm/s^2)
 
-    # Extract points from the DXF using the generate_points_from_dxf function
-    extracted_points = generate_points_from_dxf(dxf_file, spacing)
-
-    # Optimize path traversal in counter-clockwise direction
-    optimized_points = optimize_path(extracted_points)
+    # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
+    optimized_points = generate_points_from_dxf(dxf_file, spacing)
 
     overlap_count = prompt_overlap_point_count()
     if overlap_count > 0 and len(optimized_points) >= 1:
