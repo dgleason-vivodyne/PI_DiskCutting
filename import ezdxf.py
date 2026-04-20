@@ -277,6 +277,31 @@ def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_ve
     plt.legend()
     plt.show()
 
+
+def prompt_overlap_point_count():
+    """Ask how many points at the start of the path to repeat at the end. Returns a non-negative int (0 = none)."""
+    print()
+    print("--- Overlap ---")
+    print(
+        "After the full path, append the first N points again (same order as the start)\n"
+        "to extend the cut over the beginning of the contour.\n"
+    )
+    while True:
+        raw = input("How many start points to repeat? [0 = none]: ").strip()
+        if raw == "":
+            print("Overlap: 0 (none).\n")
+            return 0
+        try:
+            n = int(raw)
+            if n < 0:
+                print("Enter a non-negative integer.")
+                continue
+            print(f"Overlap: {n} point(s) from the start appended after the path.\n")
+            return n
+        except ValueError:
+            print("Enter an integer, e.g. 0 or 10.")
+
+
 if __name__ == '__main__':
     dxf_file = "SingleChipUpperLung.dxf"  # Path to your DXF file
     spacing = 0.01  # Spacing between points (in mm)
@@ -288,7 +313,12 @@ if __name__ == '__main__':
 
     # Optimize path traversal in counter-clockwise direction
     optimized_points = optimize_path(extracted_points)
- 
+
+    overlap_count = prompt_overlap_point_count()
+    if overlap_count > 0 and len(optimized_points) >= 1:
+        n_extra = min(int(overlap_count), len(optimized_points))
+        optimized_points = np.vstack([optimized_points, optimized_points[:n_extra]])
+
     # Compute time and velocity for optimized path
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
 
