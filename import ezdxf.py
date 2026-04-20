@@ -384,29 +384,44 @@ def build_cutting_path_with_bridges(
 ):
     """
     Concatenate contours with travel segments between them.
-    For each contour after the first: rotate so nearest entry to previous exit is first,
-    insert interpolated travel (not cut), then emit cut points (with overlap on closed).
-    Returns (points_Nx2, is_cut_bool_1d).
+    Before each contour, closed chains get a cyclic shift and open chains a forward/reverse choice
+    so entry is near the previous endpoint and exit near the next contour (joint cost). Travel is
+    then inserted, then cut points (overlap on closed).
+
+    Travel between contours is a straight XY segment (rapid); it does not avoid crossing uncut
+    regions. Prefer preserving DXF contour order if greedy centroid ordering would cause bad jumps.
 
     Point count vs raw DXF interpolation: entity samples are unchanged. Extra rows come from
     (1) travel between contours — many if dense_travel (~distance/spacing per gap), or 2 per
     gap if dense_travel=False; (2) overlap on closed contours if enabled.
     """
     # Same-location stitches (travel end == next cut start) must merge; float noise handled too.
-    junction_eps_mm = max(1e-6, float(spacing) * 1e-4)
+    junction_eps_mm = bridge_junction_epsilon_mm(spacing)
 
-    chunks_pts = []
-    chunks_cut = []
-    prev_exit = None
-
-    for idx, c in enumerate(contours_ordered):
+    working = []
+    for c in contours_ordered:
         pts = np.asarray(c["points"], dtype=float)
-        closed = bool(c["closed"])
         if len(pts) == 0:
             continue
+        working.append({**c, "points": pts.copy()})
+
+    chunks_pts = []
+    prev_exit = None
+    nC = len(working)
+
+    for idx, c in enumerate(working):
+        pts = np.asarray(c["points"], dtype=float).copy()
+        closed = bool(c["closed"])
+        is_first = idx == 0
+        is_last = idx == nC - 1
+        next_target = contour_centroid(working[idx + 1]["points"]) if not is_last else None
+
+        if closed:
+            pts = optimize_closed_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last)
+        else:
+            pts = orient_open_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last)
 
         if idx > 0:
-            pts = rotate_contour_to_entry(pts, closed, prev_exit)
             travel = travel_polyline_between(prev_exit, pts[0], spacing, dense=dense_travel)
             if len(travel) > 0 and np.allclose(travel[0], prev_exit, atol=junction_eps_mm):
                 travel = travel[1:]
@@ -415,19 +430,15 @@ def build_cutting_path_with_bridges(
                 travel = travel[:-1]
             if len(travel) > 0:
                 chunks_pts.append(travel)
-                chunks_cut.append(np.zeros(len(travel), dtype=bool))
 
         cut_pts = apply_overlap_closed(pts, closed, overlap_count, overlap_fraction)
         chunks_pts.append(cut_pts)
-        chunks_cut.append(np.ones(len(cut_pts), dtype=bool))
         prev_exit = cut_pts[-1]
 
     if not chunks_pts:
-        return np.empty((0, 2)), np.empty(0, dtype=bool)
+        return np.empty((0, 2))
     points = np.vstack(chunks_pts)
-    is_cut = np.concatenate(chunks_cut)
-    points, is_cut = dedupe_consecutive_points(points, is_cut, junction_eps_mm)
-    return points, is_cut
+    return dedupe_consecutive_points(points, junction_eps_mm)
 
 def optimize_path(points):
     """
@@ -501,28 +512,11 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
         vertical_velocities.append(vertical_velocity)
     return relative_times, horizontal_velocities, vertical_velocities
 
-def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration, is_cut=None):
-    """Generates CSV with positions and velocities; optional Cut column (1=cut, 0=travel)."""
-    fuzz = 0.001
+def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration, spacing_mm=0.01):
+    """Generates CSV with Time, positions, and velocities (five columns; DMS-compatible)."""
+    eps = bridge_junction_epsilon_mm(spacing_mm)
     points = np.asarray(points, dtype=float)
-    if is_cut is None:
-        unique_points = remove_close_points(points, fuzz)
-        is_cut_u = None
-    else:
-        is_cut = np.asarray(is_cut, dtype=bool)
-        unique_pts = []
-        cut_flags = []
-        for i, pt in enumerate(points):
-            if not unique_pts:
-                unique_pts.append(pt.copy())
-                cut_flags.append(is_cut[i])
-                continue
-            if any(np.linalg.norm(pt - p) < fuzz for p in unique_pts):
-                continue
-            unique_pts.append(pt.copy())
-            cut_flags.append(is_cut[i])
-        unique_points = np.array(unique_pts)
-        is_cut_u = np.array(cut_flags, dtype=bool)
+    unique_points = dedupe_consecutive_points(points, eps)
 
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(
         unique_points, max_velocity, max_acceleration
@@ -542,8 +536,6 @@ def generate_csv_from_points(points, output_filename, max_velocity, max_accelera
         "Vertical position (mm)": rel_points[:, 1],
         "Vertical velocity (mm/s)": vertical_velocities,
     }
-    if is_cut_u is not None and len(is_cut_u) == len(unique_points):
-        pvt_data["Cut (1=cut 0=travel)"] = is_cut_u.astype(int)
 
     pvt_df = pd.DataFrame(pvt_data)
     pvt_df.to_csv(output_filename, index=False)
@@ -699,9 +691,7 @@ if __name__ == '__main__':
     )
 
     output_csv = os.path.splitext(dxf_resolved)[0] + "_pvt.csv"
-    generate_csv_from_points(
-        optimized_points, output_csv, max_velocity, max_acceleration, is_cut=is_cut
-    )
+    generate_csv_from_points(optimized_points, output_csv, max_velocity, max_acceleration, spacing_mm=spacing)
 
     preview_png = os.path.splitext(dxf_resolved)[0] + "_preview.png"
     plot_points_with_velocity_vectors(
