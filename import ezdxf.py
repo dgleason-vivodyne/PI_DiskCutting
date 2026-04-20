@@ -102,17 +102,16 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     return np.array(points)
 
-def remove_close_points(points, fuzz):
-    """Removes points that are within 'fuzz' distance of each other."""
-    tree = KDTree(points)
-    unique_points = []
-
-    for i, point in enumerate(points):
-        # Query all points within fuzz distance from the current point
-        if not any(np.linalg.norm(point - p) < fuzz for p in unique_points):
-            unique_points.append(point)
-
-    return np.array(unique_points)
+def dedupe_consecutive_points(points, eps_mm):
+    """Drop consecutive duplicate positions only (keeps overlap retraces that revisit earlier XY)."""
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return pts
+    out = [pts[0]]
+    for i in range(1, len(pts)):
+        if float(np.linalg.norm(pts[i] - out[-1])) >= eps_mm:
+            out.append(pts[i])
+    return np.array(out, dtype=float)
 
 # Function to compute time based on max velocity and max acceleration
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
@@ -205,9 +204,9 @@ def optimize_path(points):
 def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration):
     """Generates a CSV file with Axis 1 and Axis 2 positions and velocities.""" 
     
-    # Remove duplicate XY points within fuzz distance
+    # Collapse consecutive duplicate XY only (overlap retraces preserved)
     fuzz = 0.001  # Specify the fuzz distance (in mm)
-    unique_points = remove_close_points(points, fuzz)
+    unique_points = dedupe_consecutive_points(points, fuzz)
 
     # Compute time and velocity for unique points
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(unique_points, max_velocity, max_acceleration)
