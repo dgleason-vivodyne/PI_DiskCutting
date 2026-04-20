@@ -324,7 +324,7 @@ def apply_overlap_closed(pts, closed, overlap_count=0, overlap_fraction=0.0):
         n_extra = min(n_extra, len(p))
     else:
         return p
-    return np.vstack([p, p[:n_extra]])
+    return np.vstack([p, p[-n_extra:]])
 
 def interpolate_line_2d(a, b, spacing):
     """Polyline from a to b with approximate spacing (at least 2 points)."""
@@ -591,10 +591,11 @@ def prompt_overlap_settings():
     print()
     print("--- Laser overlap (closed contours only) ---")
     print(
-        "After one full pass on a closed loop, the path can repeat the first part of the loop\n"
-        "again so the laser passes over the same region twice (stronger cut).\n"
-        "  • By count: repeat the first N interpolated points (integer ≥ 1).\n"
-        "  • By fraction: repeat the first (fraction × loop length) points, e.g. 0.05 = 5%.\n"
+        "After one full pass on a closed loop, the path can repeat the last part of the loop\n"
+        "again so the laser passes over the same region twice (stronger cut). The end of the loop\n"
+        "is used so the final position stays near the perimeter exit for travel to the next contour.\n"
+        "  • By count: repeat the last N interpolated points (integer ≥ 1).\n"
+        "  • By fraction: repeat the last (fraction × loop length) points, e.g. 0.05 = 5%.\n"
         "If you enter a count > 0, the fraction is ignored.\n"
     )
     overlap_count = 0
@@ -608,7 +609,7 @@ def prompt_overlap_settings():
     mode = input("Use (c)ount of points or (f)raction of loop? [c/f, default f]: ").strip().lower()
     if mode in ("c", "count"):
         while True:
-            raw = input("Number of points to repeat from the start of each closed loop [e.g. 10]: ").strip()
+            raw = input("Number of points to repeat from the end of each closed loop [e.g. 10]: ").strip()
             try:
                 overlap_count = int(raw)
                 if overlap_count < 1:
