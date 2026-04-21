@@ -339,13 +339,18 @@ def generate_points_from_dxf(dxf_file, spacing):
     **endpoint** is first—cyclic shifts are not used on open polylines (they would add an
     artificial wrap jump mid-contour). Contours are concatenated in contour order (large moves
     between separate contours remain).
+
+    Returns ``(flat_points, contour_chunks)`` where ``contour_chunks`` is a list of ``(N,2)``
+    arrays used for laser on/off insertion in the CSV exporter.
     """
     dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
     doc, contours = generate_contours_from_dxf(dxf_file, spacing)
     apply_startpoint_seam_rotations(doc, contours)
     if not contours:
-        return np.empty((0, 2))
-    return np.vstack([c["points"] for c in contours])
+        return np.empty((0, 2)), []
+    chunks = [np.asarray(c["points"], dtype=float).copy() for c in contours]
+    flat = np.vstack(chunks)
+    return flat, chunks
 
 
 def dedupe_consecutive_points(points, eps_mm):
@@ -630,19 +635,25 @@ if __name__ == '__main__':
     max_acceleration = 5000  # Max acceleration (in mm/s^2)
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
-    optimized_points = generate_points_from_dxf(dxf_file, spacing)
+    optimized_points, contour_chunks = generate_points_from_dxf(dxf_file, spacing)
 
     overlap_count = prompt_overlap_point_count()
+    n_overlap = 0
     if overlap_count > 0 and len(optimized_points) >= 1:
-        n_extra = min(int(overlap_count), len(optimized_points))
-        optimized_points = np.vstack([optimized_points, optimized_points[:n_extra]])
+        n_overlap = min(int(overlap_count), len(optimized_points))
+        optimized_points = np.vstack([optimized_points, optimized_points[:n_overlap]])
 
-    # Compute time and velocity for optimized path
+    # Compute time and velocity for optimized path (plot)
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
 
-    # Generate the CSV output (with duplicates removed)
     output_csv = dxf_file.replace(".dxf", "_pvt.csv")
-    generate_csv_from_points(optimized_points, output_csv, max_velocity, max_acceleration)
+    generate_csv_from_points(
+        optimized_points,
+        output_csv,
+        max_velocity,
+        max_acceleration,
+        contour_chunks=contour_chunks,
+        overlap_count=n_overlap,
+    )
 
-    # Plot the optimized path with velocity vectors
     plot_points_with_velocity_vectors(optimized_points, horizontal_velocities, vertical_velocities)
