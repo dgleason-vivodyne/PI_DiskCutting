@@ -365,6 +365,31 @@ def dedupe_consecutive_points(points, eps_mm):
     return np.array(out, dtype=float)
 
 
+def flatten_contours_with_per_contour_overlap(
+    contour_chunks: list,
+    overlap_count: int,
+    dedupe_eps_mm: float = 0.001,
+) -> np.ndarray:
+    """
+    Concatenate contours in order. When ``overlap_count`` > 0, each contour is extended by
+    appending its own first ``N`` vertices again (``N = min(overlap_count, len(contour))``) so the
+    seam can be re-cut before laser-off / travel to the next shape.
+    """
+    overlap_n = max(0, int(overlap_count))
+    chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), dedupe_eps_mm) for c in contour_chunks]
+    chunks_d = [c for c in chunks_d if len(c) >= 1]
+    parts = []
+    for cc in chunks_d:
+        if overlap_n > 0:
+            n_take = min(overlap_n, len(cc))
+            parts.append(np.vstack([cc, cc[:n_take]]))
+        else:
+            parts.append(cc)
+    if not parts:
+        return np.empty((0, 2))
+    return np.vstack(parts)
+
+
 # Function to compute time based on max velocity and max acceleration
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
     """Calculate the time to move a given distance considering max velocity and max acceleration."""
