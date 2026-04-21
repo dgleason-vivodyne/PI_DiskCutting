@@ -1,6 +1,6 @@
+import csv
 import ezdxf
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.spatial import KDTree
 import math
@@ -454,38 +454,104 @@ def optimize_path(points):
     return sorted_points[optimized_order]
 
 
-# Function to generate the CSV
-def generate_csv_from_points(points, output_filename, max_velocity, max_acceleration):
-    """Generates a CSV file with Axis 1 and Axis 2 positions and velocities."""
+_LASER_ON_ROWS = (
+    ("set laser voltage to", "1", "", "", ""),
+    ("turn laser on", "", "", "", ""),
+)
+_LASER_OFF_ROWS = (
+    ("set laser voltage to", "0", "", "", ""),
+    ("turn laser off", "", "", "", ""),
+)
 
-    # Collapse consecutive duplicate XY only (overlap retraces preserved)
-    fuzz = 0.001  # Specify the fuzz distance (in mm)
-    unique_points = dedupe_consecutive_points(points, fuzz)
 
-    # Compute time and velocity for unique points
-    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(unique_points, max_velocity, max_acceleration)
+def _segment_time_velocity(p0, p1, max_velocity, max_acceleration):
+    """Returns (dt, vx, vy) for motion from p0 to p1."""
+    p0 = np.asarray(p0, dtype=float).reshape(2)
+    p1 = np.asarray(p1, dtype=float).reshape(2)
+    dist = float(np.linalg.norm(p1 - p0))
+    dt = calculate_time_to_move(dist, max_velocity, max_acceleration)
+    if dist <= 1e-15 or dt <= 1e-15:
+        return 0.0, 0.0, 0.0
+    return dt, float((p1[0] - p0[0]) / dt), float((p1[1] - p0[1]) / dt)
 
-    # Make the moves relative (i.e., subtract the first data point from all data points in X and Y, then subtract n-1th point from nth)
-    unique_points[:,0] = unique_points[:,0] - unique_points[0,0]
-    unique_points[:,1] = unique_points[:,1] - unique_points[0,1]
-    first_point = unique_points[0:1]
-    deltas = np.diff(unique_points, axis=0)
-    rel_points = np.vstack([first_point, deltas])
 
-    # Create DataFrame with the required data in the specified order
-    pvt_data = {
-        "Time (s)": times,
-        "Horizontal position (mm)": rel_points[:, 0],
-        "Horizontal velocity (mm/s)": horizontal_velocities,
-        "Vertical position (mm)": rel_points[:, 1],
-        "Vertical velocity (mm/s)": vertical_velocities
-    }
+def generate_csv_from_points(
+    points,
+    output_filename,
+    max_velocity,
+    max_acceleration,
+    contour_chunks=None,
+    overlap_count: int = 0,
+):
+    """
+    Writes PVT CSV with laser command rows: after the header, ``set laser voltage to 1`` and
+    ``turn laser on``, then ``0,0,0,0,0``; before each inter-contour travel (and before overlap
+    retrace travel) ``set laser voltage to 0`` and ``turn laser off``; after travel, laser on
+    again before cutting. Ends with laser off.
 
-    pvt_df = pd.DataFrame(pvt_data)
+    ``contour_chunks``: list of (N,2) arrays, one per DXF contour; if omitted, ``points`` is
+    treated as a single contour. ``overlap_count`` appends the first N points of the job (after
+    dedupe) to the end for overlap cutting.
+    """
+    fuzz = 0.001
+    if contour_chunks is not None and len(contour_chunks) > 0:
+        chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), fuzz) for c in contour_chunks]
+        chunks_d = [c for c in chunks_d if len(c) >= 1]
+    else:
+        chunks_d = [dedupe_consecutive_points(np.asarray(points, dtype=float), fuzz)]
+    if not chunks_d or len(chunks_d[0]) == 0:
+        raise ValueError("No points to export.")
 
-    # Save to CSV
-    pvt_df.to_csv(output_filename, index=False)
-    print(f"✅ CSV file saved to {output_filename}")
+    flat_pre = np.vstack(chunks_d)
+    starts = [0]
+    for c in chunks_d:
+        starts.append(starts[-1] + len(c))
+    overlap_n = max(0, int(overlap_count))
+    if overlap_n > 0:
+        if overlap_n > len(flat_pre):
+            overlap_n = len(flat_pre)
+        full = np.vstack([flat_pre, flat_pre[:overlap_n]])
+    else:
+        full = flat_pre
+
+    overlap_start_idx = len(flat_pre) if overlap_n > 0 else -1
+    boundary_next = set()
+    for s in starts[1:-1]:
+        boundary_next.add(s)
+    if overlap_start_idx >= 0:
+        boundary_next.add(overlap_start_idx)
+
+    headers = [
+        "Time (s)",
+        "Horizontal position (mm)",
+        "Horizontal velocity (mm/s)",
+        "Vertical position (mm)",
+        "Vertical velocity (mm/s)",
+    ]
+
+    with open(output_filename, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for row in _LASER_ON_ROWS:
+            w.writerow(row)
+        w.writerow([0, 0, 0, 0, 0])
+
+        for seg in range(len(full) - 1):
+            if seg + 1 in boundary_next:
+                for row in _LASER_OFF_ROWS:
+                    w.writerow(row)
+            dt, vx, vy = _segment_time_velocity(full[seg], full[seg + 1], max_velocity, max_acceleration)
+            dx = float(full[seg + 1, 0] - full[seg, 0])
+            dy = float(full[seg + 1, 1] - full[seg, 1])
+            w.writerow([dt, dx, vx, dy, vy])
+            if seg + 1 in boundary_next:
+                for row in _LASER_ON_ROWS:
+                    w.writerow(row)
+
+        for row in _LASER_OFF_ROWS:
+            w.writerow(row)
+
+    print(f"CSV file saved to {output_filename}")
 
 
 # Function to plot optimized path with velocity vectors
