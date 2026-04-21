@@ -515,41 +515,43 @@ def generate_csv_from_points(
 ):
     """
     Writes PVT CSV with laser command rows: after the header, ``set laser voltage to 1`` and
-    ``turn laser on``, then ``0,0,0,0,0``; before each inter-contour travel (and before overlap
-    retrace travel) ``set laser voltage to 0`` and ``turn laser off``; after travel, laser on
-    again before cutting. Ends with laser off.
+    ``turn laser on``, then ``0,0,0,0,0``; after each contour's path (including its overlap
+    retrace, if any) ``set laser voltage to 0`` and ``turn laser off``; then travel to the next
+    contour and laser on again. Ends with laser off.
 
     ``contour_chunks``: list of (N,2) arrays, one per DXF contour; if omitted, ``points`` is
-    treated as a single contour. ``overlap_count`` appends the first N points of the job (after
-    dedupe) to the end for overlap cutting.
+    treated as a single contour. ``overlap_count``: for each contour, append that shape's first N
+    vertices again (after dedupe) before laser-off / travel to the next contour.
     """
     fuzz = 0.001
+    overlap_n = max(0, int(overlap_count))
+
     if contour_chunks is not None and len(contour_chunks) > 0:
         chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), fuzz) for c in contour_chunks]
         chunks_d = [c for c in chunks_d if len(c) >= 1]
+        if not chunks_d:
+            raise ValueError("No points to export.")
+        full = flatten_contours_with_per_contour_overlap(contour_chunks, overlap_n, fuzz)
+        if len(full) < 1:
+            raise ValueError("No points to export.")
+        starts = [0]
+        for c in chunks_d:
+            ext_len = len(c) + (min(overlap_n, len(c)) if overlap_n > 0 else 0)
+            starts.append(starts[-1] + ext_len)
     else:
-        chunks_d = [dedupe_consecutive_points(np.asarray(points, dtype=float), fuzz)]
-    if not chunks_d or len(chunks_d[0]) == 0:
-        raise ValueError("No points to export.")
+        cc = dedupe_consecutive_points(np.asarray(points, dtype=float), fuzz)
+        if len(cc) < 1:
+            raise ValueError("No points to export.")
+        if overlap_n > 0:
+            n_take = min(overlap_n, len(cc))
+            full = np.vstack([cc, cc[:n_take]])
+        else:
+            full = cc
+        starts = [0, len(full)]
 
-    flat_pre = np.vstack(chunks_d)
-    starts = [0]
-    for c in chunks_d:
-        starts.append(starts[-1] + len(c))
-    overlap_n = max(0, int(overlap_count))
-    if overlap_n > 0:
-        if overlap_n > len(flat_pre):
-            overlap_n = len(flat_pre)
-        full = np.vstack([flat_pre, flat_pre[:overlap_n]])
-    else:
-        full = flat_pre
-
-    overlap_start_idx = len(flat_pre) if overlap_n > 0 else -1
     boundary_next = set()
     for s in starts[1:-1]:
         boundary_next.add(s)
-    if overlap_start_idx >= 0:
-        boundary_next.add(overlap_start_idx)
 
     headers = [
         "Time (s)",
@@ -630,12 +632,12 @@ def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_ve
 
 
 def prompt_overlap_point_count():
-    """Ask how many points at the start of the path to repeat at the end. Returns a non-negative int (0 = none)."""
+    """Ask how many start vertices to repeat per contour before laser-off. Returns a non-negative int (0 = none)."""
     print()
     print("--- Overlap ---")
     print(
-        "After the full path, append the first N points again (same order as the start)\n"
-        "to extend the cut over the beginning of the contour.\n"
+        "For each contour (each closed shape), append that contour's first N vertices again\n"
+        "before laser-off / travel to the next shape — to re-cut the seam near the start.\n"
     )
     while True:
         raw = input("How many start points to repeat? [0 = none]: ").strip()
@@ -647,7 +649,7 @@ def prompt_overlap_point_count():
             if n < 0:
                 print("Enter a non-negative integer.")
                 continue
-            print(f"Overlap: {n} point(s) from the start appended after the path.\n")
+            print(f"Overlap: {n} start vertex/vertices replayed per contour before each laser-off (except if N=0).\n")
             return n
         except ValueError:
             print("Enter an integer, e.g. 0 or 10.")
@@ -663,10 +665,8 @@ if __name__ == '__main__':
     optimized_points, contour_chunks = generate_points_from_dxf(dxf_file, spacing)
 
     overlap_count = prompt_overlap_point_count()
-    n_overlap = 0
-    if overlap_count > 0 and len(optimized_points) >= 1:
-        n_overlap = min(int(overlap_count), len(optimized_points))
-        optimized_points = np.vstack([optimized_points, optimized_points[:n_overlap]])
+    n_overlap = int(overlap_count) if overlap_count > 0 else 0
+    optimized_points = flatten_contours_with_per_contour_overlap(contour_chunks, n_overlap)
 
     # Compute time and velocity for optimized path (plot)
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
