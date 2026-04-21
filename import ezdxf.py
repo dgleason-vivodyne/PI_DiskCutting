@@ -26,7 +26,6 @@ def _is_startpoints_layer_name(entity) -> bool:
     return str(getattr(entity.dxf, "layer", "") or "").strip().lower() == _EXCLUDED_LAYER_NAME.lower()
 
 
-# Startpoint, seam handling and point ordering functions
 def collect_startpoint_circle_centers(doc) -> np.ndarray:
     """CIRCLE entities on layer Startpoints: centers used to pick seam start on each cut contour."""
     centers = []
@@ -124,49 +123,6 @@ def apply_startpoint_seam_rotations(doc, contours) -> bool:
     return did_any
 
 
-def _infer_chain_closed(points, spacing, gap_threshold, single_circle, single_full_ellipse):
-    p = np.asarray(points, dtype=float)
-    if len(p) < 3:
-        return False
-    if single_circle:
-        return True
-    if single_full_ellipse:
-        return True
-    d_close = float(np.linalg.norm(p[0] - p[-1]))
-    return d_close <= max(spacing * 3.0, gap_threshold * 0.5)
-
-
-# Densification and segment orientation functions
-def _chord_dense_samples(p0: np.ndarray, p1: np.ndarray, spacing: float) -> np.ndarray:
-    """Straight samples from ``p0`` to ``p1`` at ``spacing`` (exclusive of ``p0``, inclusive of ``p1``)."""
-    p0 = np.asarray(p0, dtype=float).reshape(2)
-    p1 = np.asarray(p1, dtype=float).reshape(2)
-    d = float(np.linalg.norm(p1 - p0))
-    if d <= 1e-12:
-        return np.empty((0, 2))
-
-    n_steps = max(1, int(np.ceil(d / float(spacing))))
-    t = np.linspace(0.0, 1.0, n_steps + 1)
-    xy = (1.0 - t)[:, None] * p0 + t[:, None] * p1
-    return xy[1:]
-
-
-def _orient_segment_to_follow_chain(raw: np.ndarray, prev_tail: np.ndarray) -> np.ndarray:
-    """
-    Prefer the sample direction whose **start** is closer to ``prev_tail`` (the last chain point).
-    DXF entity order is often draw order, not always head-to-tail along the cut; reversing removes
-    bogus long hops that look like wrong NN order in previews.
-    """
-    r = np.asarray(raw, dtype=float)
-    if len(r) < 2:
-        return r.copy()
-    d_fwd = float(np.linalg.norm(r[0] - prev_tail))
-    d_rev = float(np.linalg.norm(r[-1] - prev_tail))
-    if d_rev < d_fwd - 1e-9:
-        return np.flipud(r)
-    return r.copy()
-
-
 # Interpolation functions
 def interpolate_arc(center, radius, start_angle, end_angle, spacing):
     """Interpolates points along an arc with equal spacing."""
@@ -233,6 +189,47 @@ def interpolate_entity_xy(entity, spacing):
             rotated.append((-y_shifted + center[0], x_shifted + center[1]))
         return np.array(rotated, dtype=float)
     return None
+
+
+def _infer_chain_closed(points, spacing, gap_threshold, single_circle, single_full_ellipse):
+    p = np.asarray(points, dtype=float)
+    if len(p) < 3:
+        return False
+    if single_circle:
+        return True
+    if single_full_ellipse:
+        return True
+    d_close = float(np.linalg.norm(p[0] - p[-1]))
+    return d_close <= max(spacing * 3.0, gap_threshold * 0.5)
+
+
+def _chord_dense_samples(p0: np.ndarray, p1: np.ndarray, spacing: float) -> np.ndarray:
+    """Straight samples from ``p0`` to ``p1`` at ``spacing`` (exclusive of ``p0``, inclusive of ``p1``)."""
+    p0 = np.asarray(p0, dtype=float).reshape(2)
+    p1 = np.asarray(p1, dtype=float).reshape(2)
+    d = float(np.linalg.norm(p1 - p0))
+    if d <= 1e-12:
+        return np.empty((0, 2))
+    n_steps = max(1, int(np.ceil(d / float(spacing))))
+    t = np.linspace(0.0, 1.0, n_steps + 1)
+    xy = (1.0 - t)[:, None] * p0 + t[:, None] * p1
+    return xy[1:]
+
+
+def _orient_segment_to_follow_chain(raw: np.ndarray, prev_tail: np.ndarray) -> np.ndarray:
+    """
+    Prefer the sample direction whose **start** is closer to ``prev_tail`` (the last chain point).
+    DXF entity order is often draw order, not always head-to-tail along the cut; reversing removes
+    bogus long hops that look like wrong NN order in previews.
+    """
+    r = np.asarray(raw, dtype=float)
+    if len(r) < 2:
+        return r.copy()
+    d_fwd = float(np.linalg.norm(r[0] - prev_tail))
+    d_rev = float(np.linalg.norm(r[-1] - prev_tail))
+    if d_rev < d_fwd - 1e-9:
+        return np.flipud(r)
+    return r.copy()
 
 
 def generate_contours_from_dxf(
