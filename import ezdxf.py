@@ -462,16 +462,6 @@ def optimize_path(points):
     return sorted_points[optimized_order]
 
 
-_LASER_ON_ROWS = (
-    ("set laser voltage to", "1", "", "", ""),
-    ("turn laser on", "", "", "", ""),
-)
-_LASER_OFF_ROWS = (
-    ("set laser voltage to", "0", "", "", ""),
-    ("turn laser off", "", "", "", ""),
-)
-
-
 def _segment_time_velocity(p0, p1, max_velocity, max_acceleration):
     """Returns (dt, vx, vy) for motion from p0 to p1."""
     p0 = np.asarray(p0, dtype=float).reshape(2)
@@ -561,6 +551,15 @@ def generate_csv_from_points(
 
     print(f"CSV file saved to {output_filename}")
 
+_LASER_ON_ROWS = (
+    ("set laser voltage to", "1", "", "", ""),
+    ("turn laser on", "", "", "", ""),
+)
+
+_LASER_OFF_ROWS = (
+    ("set laser voltage to", "0", "", "", ""),
+    ("turn laser off", "", "", "", ""),
+)
 
 # Function to plot optimized path with velocity vectors
 def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_velocities, offset_distance=0.001):
