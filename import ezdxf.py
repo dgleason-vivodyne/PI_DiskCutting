@@ -26,6 +26,7 @@ def _is_startpoints_layer_name(entity) -> bool:
     return str(getattr(entity.dxf, "layer", "") or "").strip().lower() == _EXCLUDED_LAYER_NAME.lower()
 
 
+# Startpoint, seam handling and point ordering functions
 def collect_startpoint_circle_centers(doc) -> np.ndarray:
     """CIRCLE entities on layer Startpoints: centers used to pick seam start on each cut contour."""
     centers = []
