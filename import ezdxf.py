@@ -769,4 +769,9 @@ if __name__ == '__main__':
         overlap_count=n_overlap,
     )
 
-    plot_points_with_velocity_vectors(optimized_points, horizontal_velocities, vertical_velocities)
+    plot_points_with_velocity_vectors(
+        optimized_points,
+        horizontal_velocities,
+        vertical_velocities,
+        csv_path=output_csv,
+    )
