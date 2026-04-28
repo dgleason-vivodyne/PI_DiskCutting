@@ -1,9 +1,12 @@
 import csv
-import ezdxf
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.spatial import KDTree
 import math
+import os
+
+import ezdxf
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.widgets import CheckButtons
+from scipy.spatial import KDTree
 
 # Cut paths: only entities on layers that are **on** in the LAYER table. Layer "Startpoints" is
 # excluded from cut geometry; CIRCLEs on Startpoints are used only as seam/start markers.
@@ -586,48 +589,133 @@ def generate_csv_from_points(
     print(f"CSV file saved to {output_filename}")
 
 
-# Function to plot optimized path with velocity vectors
-def plot_points_with_velocity_vectors(points, horizontal_velocities, vertical_velocities, offset_distance=0.001):
-    """Plots the optimized points with velocity vectors and labels the order of points, offset to the outside."""
-    num_points = len(points)
+def load_pvt_csv_segment_deltas(csv_path):
+    """Parse PVT CSV motion rows: columns are time, dx, vx, dy, vy — return (N, 2) dx, dy."""
+    deltas = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) < 5:
+                continue
+            try:
+                float(row[0])
+                dx = float(row[1])
+                dy = float(row[3])
+            except ValueError:
+                continue
+            deltas.append((dx, dy))
+    return np.asarray(deltas, dtype=float)
 
-    # Compute centroid (center of mass)
+
+def deltas_to_polyline(start_xy, deltas):
+    """start_xy (2,), deltas (N, 2) -> (N + 1, 2) polyline including start (cumulative CSV path)."""
+    start_xy = np.asarray(start_xy, dtype=float).reshape(2)
+    if len(deltas) == 0:
+        return start_xy.reshape(1, 2)
+    cum = np.cumsum(deltas, axis=0)
+    return np.vstack([start_xy, start_xy + cum])
+
+
+# Function to plot optimized path with velocity vectors
+def plot_points_with_velocity_vectors(
+    points,
+    horizontal_velocities,
+    vertical_velocities,
+    offset_distance=0.001,
+    csv_path=None,
+):
+    """
+    Plot DXF-derived polyline with optional velocity quivers and point indices.
+
+    If ``csv_path`` is set and the file exists, overlay the path from cumulative
+    CSV dx/dy aligned to ``points[0]``. Checkboxes toggle DXF path, CSV replay,
+    quiver, and point labels.
+    """
     centroid = np.mean(points, axis=0)
 
-    # Create a plot with both points and velocity vectors
-    plt.figure(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plt.subplots_adjust(right=0.78)
 
-    # Plot the path
-    plt.plot(points[:, 0], points[:, 1], color='blue', marker='o', markersize=4, label='Path')
+    (ln_dxf,) = ax.plot(
+        points[:, 0],
+        points[:, 1],
+        color="blue",
+        marker="o",
+        markersize=3,
+        linestyle="-",
+        label="DXF samples",
+        zorder=2,
+    )
 
-    # Plot velocity vectors
-    plt.quiver(points[:, 0], points[:, 1], horizontal_velocities, vertical_velocities, angles='xy', scale_units='xy', scale=0.1, color='red', label='Velocity Vectors')
+    quiv = ax.quiver(
+        points[:, 0],
+        points[:, 1],
+        horizontal_velocities,
+        vertical_velocities,
+        angles="xy",
+        scale_units="xy",
+        scale=0.1,
+        color="red",
+        label="Velocity",
+        zorder=3,
+    )
 
-    # Label each point with its order in the sequence, offset to the outside of the path
+    label_objs = []
     for i, point in enumerate(points):
-
-        # Calculate direction vector from the centroid to the point
         direction = np.array([point[0] - centroid[0], point[1] - centroid[1]])
-
-        # Normalize the direction vector
         direction_normalized = direction / np.linalg.norm(direction)
-
-        # Offset the label slightly outside the path
         offset = direction_normalized * offset_distance
-
-        # Apply offset to the label position
         label_x = point[0] + offset[0]
         label_y = point[1] + offset[1]
+        t = ax.text(label_x, label_y, str(i), fontsize=7, color="black", ha="center", va="center", zorder=4)
+        label_objs.append(t)
 
+    ln_csv = None
+    if csv_path and os.path.isfile(csv_path):
+        deltas = load_pvt_csv_segment_deltas(csv_path)
+        csv_xy = deltas_to_polyline(points[0], deltas)
+        (ln_csv,) = ax.plot(
+            csv_xy[:, 0],
+            csv_xy[:, 1],
+            color="tab:orange",
+            marker="x",
+            markersize=3,
+            linestyle="--",
+            linewidth=1.2,
+            label="CSV",
+            zorder=5,
+        )
 
-        # Plot the label with an offset
-        plt.text(label_x, label_y, str(i), fontsize=8, color='black', ha='center', va='center')
+    ax.set_xlabel("X Coordinate (mm)")
+    ax.set_ylabel("Y Coordinate (mm)")
+    ax.set_title("Path: DXF vs CSV replay (use checkboxes)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="upper left", fontsize=8)
 
-    plt.xlabel("X Coordinate (mm)")
-    plt.ylabel("Y Coordinate (mm)")
-    plt.title("Optimized Path with Velocity Vectors and Point Order")
-    plt.axis("equal")
-    plt.legend()
+    rax = plt.axes((0.80, 0.35, 0.18, 0.22))
+    check_labels = ["DXF path", "Velocities", "Point labels"]
+    actives = [True, True, True]
+    if ln_csv is not None:
+        check_labels.insert(1, "CSV replay")
+        actives.insert(1, True)
+    chk = CheckButtons(rax, check_labels, actives)
+
+    def on_check_click(_label):
+        status = chk.get_status()
+        i = 0
+        ln_dxf.set_visible(status[i])
+        i += 1
+        if ln_csv is not None:
+            ln_csv.set_visible(status[i])
+            i += 1
+        quiv.set_visible(status[i])
+        i += 1
+        vis_labels = status[i]
+        for t in label_objs:
+            t.set_visible(vis_labels)
+        fig.canvas.draw_idle()
+
+    chk.on_clicked(on_check_click)
+
     plt.show()
 
 
