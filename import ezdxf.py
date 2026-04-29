@@ -1,6 +1,8 @@
 import csv
 import math
 import os
+import tkinter as tk
+from tkinter import filedialog
 
 import ezdxf
 import matplotlib.pyplot as plt
@@ -345,8 +347,10 @@ def generate_points_from_dxf(dxf_file, spacing):
 
     Returns ``(flat_points, contour_chunks)`` where ``contour_chunks`` is a list of ``(N,2)``
     arrays used for laser on/off insertion in the CSV exporter.
+
+    ``dxf_file`` must be the path to the DXF on disk (e.g. from a file dialog when run as a script).
     """
-    dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"
+    # dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"  # legacy hardcoded override
     doc, contours = generate_contours_from_dxf(dxf_file, spacing)
     apply_startpoint_seam_rotations(doc, contours)
     if not contours:
@@ -743,8 +747,29 @@ def prompt_overlap_point_count():
             print("Enter an integer, e.g. 0 or 10.")
 
 
+def prompt_dxf_path():
+    """Native file dialog to pick a DXF. Returns path string, or empty string if cancelled."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    path = filedialog.askopenfilename(
+        title="Select DXF file to convert",
+        filetypes=[("DXF files", "*.dxf"), ("All files", "*.*")],
+    )
+    root.destroy()
+    return path
+
+
 if __name__ == '__main__':
-    dxf_file = "SingleChipUpperLung.dxf"  # Path to your DXF file
+    dxf_file = prompt_dxf_path()
+    if not dxf_file:
+        print("No DXF file selected. Exiting.")
+        raise SystemExit(0)
+    print(f"Using DXF: {dxf_file}")
+
     spacing = 0.01  # Spacing between points (in mm)
     max_velocity = 100  # Max velocity (in mm/sec)
     max_acceleration = 5000  # Max acceleration (in mm/s^2)
