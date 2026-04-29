@@ -14,6 +14,11 @@ from scipy.spatial import KDTree
 # excluded from cut geometry; CIRCLEs on Startpoints are used only as seam/start markers.
 _EXCLUDED_LAYER_NAME = "Startpoints"
 
+# Companion absolute-coordinate export: P(abs) = Origin + P(rel), pattern vertex P(rel) = full[i].
+""" MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_X_MM = 96.5632 """
+""" MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_Y_MM = 103.6625 """
+MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_X_MM = 0
+MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_Y_MM = 0
 
 def _entity_layer_processed(doc, entity) -> bool:
     """True if entity's layer is on and not the Startpoints layer."""
@@ -521,10 +526,14 @@ def generate_csv_from_points(
     overlap_count: int = 0,
 ):
     """
-    Writes PVT CSV with laser command rows: after the header, ``set laser voltage to 1`` and
-    ``turn laser on``, then ``0,0,0,0,0``; after each contour's path (including its overlap
-    retrace, if any) ``set laser voltage to 0`` and ``turn laser off``; then travel to the next
-    contour and laser on again. Ends with laser off.
+    Writes the main PVT CSV with laser command rows (``set laser voltage`` / ``turn laser on`` /
+    ``turn laser off``), ``0,0,0,0,0`` sync, motion rows, and laser toggles between contours.
+
+    Writes a sibling ``*_absolute.csv`` with the **same column headers** as the main file and **no**
+    laser I/O text rows. It starts and ends with a ``0,0,0,0,0`` PVT row; motion rows use columns
+    2 and 4 as absolute mm positions (endpoint after each step): ``P(abs) = Origin + P(rel)``
+    with Origin = chuck-center-to-objective offsets and ``P(rel)`` = pattern vertex ``full[i]``
+    (not incremental dx/dy).
 
     ``contour_chunks``: list of (N,2) arrays, one per DXF contour; if omitted, ``points`` is
     treated as a single contour. ``overlap_count``: for each contour, append that shape's first N
@@ -567,13 +576,26 @@ def generate_csv_from_points(
         "Vertical position (mm)",
         "Vertical velocity (mm/s)",
     ]
+    ox = float(MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_X_MM)
+    oy = float(MICROSCOPE_CHUCK_CENTER_TO_OBJECTIVE_OFFSET_Y_MM)
 
-    with open(output_filename, "w", newline="", encoding="utf-8") as f:
+    if output_filename.lower().endswith(".csv"):
+        abs_output_filename = output_filename[:-4] + "_absolute.csv"
+    else:
+        abs_output_filename = output_filename + "_absolute.csv"
+
+    with open(output_filename, "w", newline="", encoding="utf-8") as f, open(
+        abs_output_filename, "w", newline="", encoding="utf-8"
+    ) as fa:
         w = csv.writer(f)
+        wa = csv.writer(fa)
         w.writerow(headers)
+        wa.writerow(headers)
         for row in _LASER_ON_ROWS:
             w.writerow(row)
+        # Sync row: same leading PVT zeros on both files; absolute cols 2/4 are still absolute XY on motion rows.
         w.writerow([0, 0, 0, 0, 0])
+        wa.writerow([0, 0, 0, 0, 0])
 
         for seg in range(len(full) - 1):
             if seg + 1 in boundary_next:
@@ -583,6 +605,15 @@ def generate_csv_from_points(
             dx = float(full[seg + 1, 0] - full[seg, 0])
             dy = float(full[seg + 1, 1] - full[seg, 1])
             w.writerow([dt, dx, vx, dy, vy])
+            wa.writerow(
+                [
+                    dt,
+                    ox + float(full[seg + 1, 0]),
+                    vx,
+                    oy + float(full[seg + 1, 1]),
+                    vy,
+                ]
+            )
             if seg + 1 in boundary_next:
                 for row in _LASER_ON_ROWS:
                     w.writerow(row)
@@ -590,7 +621,10 @@ def generate_csv_from_points(
         for row in _LASER_OFF_ROWS:
             w.writerow(row)
 
+        wa.writerow([0, 0, 0, 0, 0])
+
     print(f"CSV file saved to {output_filename}")
+    print(f"Absolute-coordinate CSV saved to {abs_output_filename}")
 
 
 def load_pvt_csv_segment_deltas(csv_path):
