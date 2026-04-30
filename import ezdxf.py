@@ -678,10 +678,6 @@ def generate_csv_from_points(
         starts = [0, len(full)]
         chunks_d = [cc]
 
-    boundary_next = set()
-    for s in starts[1:-1]:
-        boundary_next.add(s)
-
     headers = [
         "Time (s)",
         "Horizontal position (mm)",
@@ -697,25 +693,30 @@ def generate_csv_from_points(
     else:
         abs_output_filename = output_filename + "_absolute.csv"
 
-    nseg = max(0, len(full) - 1)
+    segs, replay, schedule = build_export_segments_with_leads(
+        full, starts, chunks_d, overlap_n, spacing, max_velocity, max_acceleration
+    )
+    if not segs:
+        raise ValueError("No export segments (empty path).")
+
     rel_rows = []
-    for seg in range(nseg):
-        dt, vx, vy = _segment_time_velocity(full[seg], full[seg + 1], max_velocity, max_acceleration)
-        dx = float(full[seg + 1, 0] - full[seg, 0])
-        dy = float(full[seg + 1, 1] - full[seg, 1])
+    for j in range(len(segs)):
+        p0, p1 = segs[j]
+        dt, vx, vy = _segment_time_velocity(p0, p1, max_velocity, max_acceleration)
+        dx = float(p1[0] - p0[0])
+        dy = float(p1[1] - p0[1])
         rel_rows.append((dt, dx, vx, dy, vy))
 
-    for k in range(len(chunks_d)):
-        base = starts[k]
-        len_c = len(chunks_d[k])
-        nt = min(overlap_n, len_c)
-        if nt <= 1:
-            continue
-        for r in range(nt - 1):
-            so = base + len_c + r
-            src = base + r
-            if 0 <= so < len(rel_rows) and 0 <= src < len(rel_rows):
-                rel_rows[so] = rel_rows[src]
+    for dst, src in replay.items():
+        if 0 <= dst < len(rel_rows) and 0 <= src < len(rel_rows):
+            rel_rows[dst] = rel_rows[src]
+
+    def _emit_motion_rows(wr, wabs, j0, j1_exclusive):
+        for j in range(j0, j1_exclusive):
+            dt, dx, vx, dy, vy = rel_rows[j]
+            _, p1 = segs[j]
+            wr.writerow([dt, dx, vx, dy, vy])
+            wabs.writerow([dt, ox + float(p1[0]), vx, oy + float(p1[1]), vy])
 
     with open(output_filename, "w", newline="", encoding="utf-8") as f, open(
         abs_output_filename, "w", newline="", encoding="utf-8"
@@ -724,29 +725,16 @@ def generate_csv_from_points(
         wa = csv.writer(fa)
         w.writerow(headers)
         wa.writerow(headers)
-        for row in _LASER_ON_ROWS:
-            w.writerow(row)
-        # Sync row: same leading PVT zeros on both files; absolute cols 2/4 are still absolute XY on motion rows.
         w.writerow([0, 0, 0, 0, 0])
         wa.writerow([0, 0, 0, 0, 0])
 
-        for seg in range(nseg):
-            if seg + 1 in boundary_next:
-                for row in _LASER_OFF_ROWS:
-                    w.writerow(row)
-            dt, dx, vx, dy, vy = rel_rows[seg]
-            w.writerow([dt, dx, vx, dy, vy])
-            wa.writerow(
-                [
-                    dt,
-                    ox + float(full[seg + 1, 0]),
-                    vx,
-                    oy + float(full[seg + 1, 1]),
-                    vy,
-                ]
-            )
-            if seg + 1 in boundary_next:
+        for kind, lo, hi in schedule:
+            if kind == "cut" and hi > lo:
                 for row in _LASER_ON_ROWS:
+                    w.writerow(row)
+            _emit_motion_rows(w, wa, lo, hi)
+            if kind == "cut" and hi > lo:
+                for row in _LASER_OFF_ROWS:
                     w.writerow(row)
 
         for row in _LASER_OFF_ROWS:
