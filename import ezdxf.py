@@ -977,4 +977,6 @@ if __name__ == '__main__':
         horizontal_velocities,
         vertical_velocities,
         csv_path=output_csv,
+        max_velocity=max_velocity,
+        max_acceleration=max_acceleration,
     )
