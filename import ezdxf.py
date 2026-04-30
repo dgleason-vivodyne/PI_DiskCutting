@@ -635,24 +635,21 @@ def generate_csv_from_points(
     max_acceleration,
     contour_chunks=None,
     overlap_count: int = 0,
+    spacing: float = 0.01,
 ):
     """
-    Writes the main PVT CSV with laser command rows (``set laser voltage`` / ``turn laser on`` /
-    ``turn laser off``), ``0,0,0,0,0`` sync, motion rows, and laser toggles between contours.
+    Writes the main PVT CSV with laser I/O only around **cut** motion (not during lead-in/out or
+    travel). Lead-in/out length (mm) is ``v_max^2 / (2 a)``; each lead is sampled into
+    ``ceil(lead_mm / spacing)`` straight segments along entry/exit tangent. Inter-contour **travel**
+    is a straight chord from end of lead-out to start of the next contour's lead-in, sampled by
+    ``spacing``. ``0,0,0,0,0`` sync starts the file; relative file ends with laser-off rows.
 
-    Writes a sibling ``*_absolute.csv`` with the **same column headers** as the main file and **no**
-    laser I/O text rows. It starts and ends with a ``0,0,0,0,0`` PVT row; motion rows use columns
-    2 and 4 as absolute mm positions (endpoint after each step): ``P(abs) = Origin + P(rel)``
-    with Origin = chuck-center-to-objective offsets and ``P(rel)`` = pattern vertex ``full[i]``
-    (not incremental dx/dy).
+    Writes a sibling ``*_absolute.csv`` with the same headers and motion order, **no** laser text
+    rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
-    ``contour_chunks``: list of (N,2) arrays, one per DXF contour; if omitted, ``points`` is
-    treated as a single contour. ``overlap_count``: for each contour, append that shape's first N
-    vertices again (after dedupe) before laser-off / travel to the next contour.
+    Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
-    Overlap retrace: after the bridge segment back to the contour start, each repeated edge reuses
-    the exact same ``(dt, dx, vx, dy, vy)`` as the corresponding first-pass segment so velocities
-    match at the seam (no independent re-timing of identical chords).
+    ``spacing``: DXF point spacing (mm), used to set lead/travel segment counts.
     """
     fuzz = 0.001
     overlap_n = max(0, int(overlap_count))
