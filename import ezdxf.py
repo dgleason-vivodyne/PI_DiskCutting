@@ -538,6 +538,10 @@ def generate_csv_from_points(
     ``contour_chunks``: list of (N,2) arrays, one per DXF contour; if omitted, ``points`` is
     treated as a single contour. ``overlap_count``: for each contour, append that shape's first N
     vertices again (after dedupe) before laser-off / travel to the next contour.
+
+    Overlap retrace: after the bridge segment back to the contour start, each repeated edge reuses
+    the exact same ``(dt, dx, vx, dy, vy)`` as the corresponding first-pass segment so velocities
+    match at the seam (no independent re-timing of identical chords).
     """
     fuzz = 0.001
     overlap_n = max(0, int(overlap_count))
