@@ -945,6 +945,7 @@ if __name__ == '__main__':
         max_acceleration,
         contour_chunks=contour_chunks,
         overlap_count=n_overlap,
+        spacing=spacing,
     )
 
     plot_points_with_velocity_vectors(
