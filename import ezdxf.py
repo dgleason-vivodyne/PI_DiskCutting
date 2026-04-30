@@ -517,6 +517,117 @@ def _segment_time_velocity(p0, p1, max_velocity, max_acceleration):
     return dt, float((p1[0] - p0[0]) / dt), float((p1[1] - p0[1]) / dt)
 
 
+def _unit2d(v):
+    v = np.asarray(v, dtype=float).reshape(2)
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return np.array([1.0, 0.0], dtype=float)
+    return (v / n).astype(float)
+
+
+def _lead_length_mm(max_velocity, max_acceleration):
+    """Distance (mm) to accelerate from 0 to ``max_velocity`` at constant ``max_acceleration``."""
+    if max_acceleration <= 1e-12:
+        return 0.0
+    return float(max_velocity * max_velocity) / (2.0 * max_acceleration)
+
+
+def _sample_polyline_straight(p_from, p_to, n_seg):
+    """``n_seg`` >= 1 segments along p_from -> p_to; returns (n_seg + 1, 2) vertices inclusive."""
+    p_from = np.asarray(p_from, dtype=float).reshape(2)
+    p_to = np.asarray(p_to, dtype=float).reshape(2)
+    n_seg = max(1, int(n_seg))
+    t = np.linspace(0.0, 1.0, n_seg + 1, dtype=float)
+    return (1.0 - t)[:, None] * p_from + t[:, None] * p_to
+
+
+def build_export_segments_with_leads(
+    full, starts, chunks_d, overlap_n, spacing, max_velocity, max_acceleration
+):
+    """
+    Build ordered motion segments: per contour (lead-in -> cut polyline with overlap ->
+    lead-out), then straight travel to the next contour's lead-in start.
+
+    Returns ``(segs, replay, schedule)`` where ``segs`` is a list of (p0, p1), ``replay`` maps
+    destination segment index -> source index for overlap retrace, and ``schedule`` is a list of
+    (kind, lo, hi) with hi exclusive segment indices into ``segs``.
+    """
+    L = _lead_length_mm(max_velocity, max_acceleration)
+    n_lead = max(1, int(np.ceil(L / spacing))) if spacing > 1e-12 else 1
+
+    segs = []
+    replay = {}
+    schedule = []
+    k_count = len(chunks_d)
+
+    for k in range(k_count):
+        V = full[starts[k] : starts[k + 1]]
+        if len(V) < 1:
+            continue
+
+        if len(V) >= 2:
+            dir_in = _unit2d(V[1] - V[0])
+            dir_out = _unit2d(V[-1] - V[-2])
+        else:
+            u = np.array([1.0, 0.0], dtype=float)
+            dir_in = u
+            dir_out = u
+
+        p_start = V[0]
+        A = p_start - dir_in * L
+        pts_in = _sample_polyline_straight(A, p_start, n_lead)
+        li_lo = len(segs)
+        for i in range(n_lead):
+            segs.append((pts_in[i].copy(), pts_in[i + 1].copy()))
+        li_hi = len(segs)
+        schedule.append(("lead_in", li_lo, li_hi))
+
+        if len(V) >= 2:
+            len_c = len(chunks_d[k])
+            nt = min(overlap_n, len_c)
+            cut_lo = len(segs)
+            for i in range(len(V) - 1):
+                segs.append((V[i].copy(), V[i + 1].copy()))
+                if nt > 1 and len_c <= i <= len_c + nt - 2:
+                    dst = len(segs) - 1
+                    src = cut_lo + (i - len_c)
+                    replay[dst] = src
+            cut_hi = len(segs)
+            schedule.append(("cut", cut_lo, cut_hi))
+        else:
+            cut_lo = len(segs)
+            schedule.append(("cut", cut_lo, cut_lo))
+
+        p_end = V[-1]
+        E = p_end + dir_out * L
+        pts_out = _sample_polyline_straight(p_end, E, n_lead)
+        lo_lo = len(segs)
+        for i in range(n_lead):
+            segs.append((pts_out[i].copy(), pts_out[i + 1].copy()))
+        lo_hi = len(segs)
+        schedule.append(("lead_out", lo_lo, lo_hi))
+
+        if k < k_count - 1:
+            W = full[starts[k + 1] : starts[k + 2]]
+            if len(W) < 1:
+                continue
+            if len(W) >= 2:
+                dn = _unit2d(W[1] - W[0])
+            else:
+                dn = np.array([1.0, 0.0], dtype=float)
+            A_next = W[0] - dn * L
+            dist = float(np.linalg.norm(A_next - E))
+            n_tr = max(1, int(np.ceil(dist / spacing))) if spacing > 1e-12 else 1
+            pts_tr = _sample_polyline_straight(E, A_next, n_tr)
+            tr_lo = len(segs)
+            for i in range(n_tr):
+                segs.append((pts_tr[i].copy(), pts_tr[i + 1].copy()))
+            tr_hi = len(segs)
+            schedule.append(("travel", tr_lo, tr_hi))
+
+    return segs, replay, schedule
+
+
 def generate_csv_from_points(
     points,
     output_filename,
