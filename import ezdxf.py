@@ -568,6 +568,7 @@ def generate_csv_from_points(
         else:
             full = cc
         starts = [0, len(full)]
+        chunks_d = [cc]
 
     boundary_next = set()
     for s in starts[1:-1]:
@@ -588,6 +589,26 @@ def generate_csv_from_points(
     else:
         abs_output_filename = output_filename + "_absolute.csv"
 
+    nseg = max(0, len(full) - 1)
+    rel_rows = []
+    for seg in range(nseg):
+        dt, vx, vy = _segment_time_velocity(full[seg], full[seg + 1], max_velocity, max_acceleration)
+        dx = float(full[seg + 1, 0] - full[seg, 0])
+        dy = float(full[seg + 1, 1] - full[seg, 1])
+        rel_rows.append((dt, dx, vx, dy, vy))
+
+    for k in range(len(chunks_d)):
+        base = starts[k]
+        len_c = len(chunks_d[k])
+        nt = min(overlap_n, len_c)
+        if nt <= 1:
+            continue
+        for r in range(nt - 1):
+            so = base + len_c + r
+            src = base + r
+            if 0 <= so < len(rel_rows) and 0 <= src < len(rel_rows):
+                rel_rows[so] = rel_rows[src]
+
     with open(output_filename, "w", newline="", encoding="utf-8") as f, open(
         abs_output_filename, "w", newline="", encoding="utf-8"
     ) as fa:
@@ -601,13 +622,11 @@ def generate_csv_from_points(
         w.writerow([0, 0, 0, 0, 0])
         wa.writerow([0, 0, 0, 0, 0])
 
-        for seg in range(len(full) - 1):
+        for seg in range(nseg):
             if seg + 1 in boundary_next:
                 for row in _LASER_OFF_ROWS:
                     w.writerow(row)
-            dt, vx, vy = _segment_time_velocity(full[seg], full[seg + 1], max_velocity, max_acceleration)
-            dx = float(full[seg + 1, 0] - full[seg, 0])
-            dy = float(full[seg + 1, 1] - full[seg, 1])
+            dt, dx, vx, dy, vy = rel_rows[seg]
             w.writerow([dt, dx, vx, dy, vy])
             wa.writerow(
                 [
