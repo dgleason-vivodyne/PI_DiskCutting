@@ -772,9 +772,12 @@ def generate_csv_from_points(
         "relative_csv_columns": ["time_s", "delta_x_mm", "vx_mm_s", "delta_y_mm", "vy_mm_s"],
         "source_csv": os.path.basename(output_filename),
     }
-    with open(meta_filename, "w", encoding="utf-8") as mf:
-        json.dump(meta_payload, mf, indent=2)
-        mf.write("\n")
+    try:
+        with open(meta_filename, "w", encoding="utf-8") as mf:
+            json.dump(meta_payload, mf, indent=2)
+            mf.write("\n")
+    except OSError as ex:
+        print(f"Warning: could not write PVT meta JSON {meta_filename}: {ex}")
 
     print(f"CSV file saved to {output_filename}")
     print(f"Absolute-coordinate CSV saved to {abs_output_filename}")
