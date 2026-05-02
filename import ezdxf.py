@@ -679,7 +679,15 @@ def generate_csv_from_points(
         starts = [0, len(full)]
         chunks_d = [cc]
 
-    headers = [
+    # Relative CSV: columns 2 and 4 are segment *deltas* (mm) for Zaber PointRelative / DMS.
+    headers_rel = [
+        "Time (s)",
+        "Horizontal delta (mm)",
+        "Horizontal velocity (mm/s)",
+        "Vertical delta (mm)",
+        "Vertical velocity (mm/s)",
+    ]
+    headers_abs = [
         "Time (s)",
         "Horizontal position (mm)",
         "Horizontal velocity (mm/s)",
@@ -724,8 +732,8 @@ def generate_csv_from_points(
     ) as fa:
         w = csv.writer(f)
         wa = csv.writer(fa)
-        w.writerow(headers)
-        wa.writerow(headers)
+        w.writerow(headers_rel)
+        wa.writerow(headers_abs)
         w.writerow([0, 0, 0, 0, 0])
         wa.writerow([0, 0, 0, 0, 0])
 
