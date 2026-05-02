@@ -648,6 +648,11 @@ def generate_csv_from_points(
     Writes a sibling ``*_absolute.csv`` with the same headers and motion order, **no** laser text
     rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
+    Writes a sibling ``<stem>.pvt.meta.json`` (same stem as the main CSV, e.g. ``foo_pvt.csv`` →
+    ``foo_pvt.pvt.meta.json``) with ``anchor_xy_mm`` = DXF WCS (mm) at the **first export segment
+    start** (lead-in start). Delta PVT omits this rigid shift; DMS applies it before ``PointRelative``
+    when the meta file is present.
+
     Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
     ``spacing``: DXF point spacing (mm), used to set lead/travel segment counts.
@@ -751,12 +756,33 @@ def generate_csv_from_points(
 
         wa.writerow([0, 0, 0, 0, 0])
 
+    p0 = np.asarray(segs[0][0], dtype=float).reshape(2)
+    meta_stem = output_filename[:-4] if output_filename.lower().endswith(".csv") else output_filename
+    meta_filename = meta_stem + ".pvt.meta.json"
+    meta_payload = {
+        "schema_version": 1,
+        "anchor_xy_mm": [float(p0[0]), float(p0[1])],
+        "description": (
+            "anchor_xy_mm is DXF WCS (mm) at the first PVT segment start (lead-in start). "
+            "Relative CSV columns 2 and 4 are deltas; this anchor is omitted there and applied by DMS when present."
+        ),
+        "max_velocity_mm_s": float(max_velocity),
+        "max_acceleration_mm_s2": float(max_acceleration),
+        "spacing_mm": float(spacing),
+        "relative_csv_columns": ["time_s", "delta_x_mm", "vx_mm_s", "delta_y_mm", "vy_mm_s"],
+        "source_csv": os.path.basename(output_filename),
+    }
+    with open(meta_filename, "w", encoding="utf-8") as mf:
+        json.dump(meta_payload, mf, indent=2)
+        mf.write("\n")
+
     print(f"CSV file saved to {output_filename}")
     print(f"Absolute-coordinate CSV saved to {abs_output_filename}")
+    print(f"PVT CAD anchor meta saved to {meta_filename}")
 
 
 def load_pvt_csv_segment_deltas(csv_path):
-    """Parse PVT CSV motion rows: columns are time, dx, vx, dy, vy — return (N, 2) dx, dy."""
+    """Parse delta PVT CSV motion rows: time, delta_x, vx, delta_y, vy (columns 0–4) — return (N, 2) dx, dy."""
     deltas = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.reader(f):
