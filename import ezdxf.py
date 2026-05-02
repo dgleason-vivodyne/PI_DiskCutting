@@ -649,7 +649,7 @@ def generate_csv_from_points(
     rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
     Writes a sibling ``<stem>.pvt.meta.json`` (same stem as the main CSV, e.g. ``foo_pvt.csv`` →
-    ``foo_pvt.pvt.meta.json``) with ``anchor_xy_mm`` = DXF WCS (mm) at the **first export segment
+    ``foo_pvt.pvt.meta.json``) with ``origin_xy_mm`` = DXF WCS (mm) at the **first export segment
     start** (lead-in start). Delta PVT omits this rigid shift; DMS applies it before ``PointRelative``
     when the meta file is present.
 
@@ -761,10 +761,10 @@ def generate_csv_from_points(
     meta_filename = meta_stem + ".pvt.meta.json"
     meta_payload = {
         "schema_version": 1,
-        "anchor_xy_mm": [float(p0[0]), float(p0[1])],
+        "origin_xy_mm": [float(p0[0]), float(p0[1])],
         "description": (
-            "anchor_xy_mm is DXF WCS (mm) at the first PVT segment start (lead-in start). "
-            "Relative CSV columns 2 and 4 are deltas; this anchor is omitted there and applied by DMS when present."
+            "origin_xy_mm is DXF WCS (mm) at the first PVT segment start (lead-in start). "
+            "Relative CSV columns 2 and 4 are deltas; this origin is omitted there and applied by DMS when present."
         ),
         "max_velocity_mm_s": float(max_velocity),
         "max_acceleration_mm_s2": float(max_acceleration),
@@ -778,7 +778,7 @@ def generate_csv_from_points(
 
     print(f"CSV file saved to {output_filename}")
     print(f"Absolute-coordinate CSV saved to {abs_output_filename}")
-    print(f"PVT CAD anchor meta saved to {meta_filename}")
+    print(f"PVT CAD origin meta saved to {meta_filename}")
 
 
 def load_pvt_csv_segment_deltas(csv_path):
@@ -837,7 +837,7 @@ def plot_points_with_velocity_vectors(
     CSV dx/dy. With lead-in/out, the replay must start at the exporter's first
     motion point: pass the same ``max_velocity`` and ``max_acceleration`` used
     for ``generate_csv_from_points`` so lead length matches the CSV. If either
-    is omitted, the overlay anchors at ``points[0]`` (legacy; misaligned when
+    is omitted, the overlay is rooted at ``points[0]`` (legacy; misaligned when
     leads are present).
 
     Checkboxes toggle DXF path, CSV replay, quiver, and point labels.
