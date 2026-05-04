@@ -171,8 +171,76 @@ def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, 
     return ellipse_points
 
 
+def interpolate_spline(entity, spacing):
+    """
+    Sample a DXF SPLINE entity to a 2D polyline in WCS (mm).
+
+    Uses ezdxf adaptive ``Spline.flattening(distance)``: ``distance`` is the maximum
+    deviation from the true curve to the approximation chord (smaller ⇒ denser polyline).
+    We pass ``spacing`` as that tolerance so it tracks the same scale as other entities.
+
+    Parameters
+    ----------
+    entity
+        A DXF entity with dxftype ``SPLINE``.
+    spacing : float
+        Flattening tolerance (mm); clamped to a small positive minimum.
+
+    Returns
+    -------
+    ndarray of shape (N, 2), dtype float64, or None if not a SPLINE or flattening fails.
+    """
+    if entity.dxftype() != "SPLINE":
+        return None
+    tol = max(float(spacing), 1e-9)
+    try:
+        verts = list(entity.flattening(distance=tol))
+    except (ValueError, AttributeError):
+        return None
+    if len(verts) < 2:
+        return None
+    return np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
+
+
+def interpolate_polyline(entity, spacing):
+    """
+    Sample a DXF ``LWPOLYLINE`` or ``POLYLINE`` (2D outline with line and bulge arcs) to XY samples.
+
+    Uses ``ezdxf.path.make_path`` to resolve straight segments and arc bulges, then ``Path.flattening``
+    with tolerance ``spacing`` (same role as for SPLINE flattening).
+
+    ``POLYLINE`` polymesh / entities that cannot be converted to a path return ``None``.
+
+    Parameters
+    ----------
+    entity
+        DXF entity with dxftype ``LWPOLYLINE`` or ``POLYLINE``.
+    spacing : float
+        Flattening tolerance (mm).
+
+    Returns
+    -------
+    ndarray of shape (N, 2), dtype float64, or None.
+    """
+    dt = entity.dxftype()
+    if dt not in ("LWPOLYLINE", "POLYLINE"):
+        return None
+    tol = max(float(spacing), 1e-9)
+    try:
+        pth = make_path(entity)
+    except Exception:
+        return None
+    try:
+        verts = list(pth.flattening(distance=tol))
+    except (ValueError, AttributeError):
+        return None
+    if len(verts) < 2:
+        return None
+    return np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
+
+
 def interpolate_entity_xy(entity, spacing):
-    """Sample one LINE/ARC/CIRCLE/ELLIPSE to a polyline in WCS (mm)."""
+    """Sample one LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE to a polyline in WCS (mm)."""
     dt = entity.dxftype()
     if dt == "LINE":
         start_point = np.array((entity.dxf.start.x, entity.dxf.start.y), dtype=float)
