@@ -291,6 +291,10 @@ def _infer_chain_closed(
         return True
     if single_full_ellipse:
         return True
+    if single_closed_spline:
+        return True
+    if single_closed_polyline:
+        return True
     d_close = float(np.linalg.norm(p[0] - p[-1]))
     return d_close <= max(spacing * 3.0, gap_threshold * 0.5)
 
@@ -410,7 +414,25 @@ def generate_contours_from_dxf(
         if len(ents) == 1 and ents[0].dxftype() == "ELLIPSE":
             span = abs(ents[0].dxf.end_param - ents[0].dxf.start_param)
             single_full_ellipse = span >= 2 * math.pi * 0.95
-        closed = _infer_chain_closed(pts, spacing, gap_threshold, single_circle, single_full_ellipse)
+        single_closed_spline = False
+        if len(ents) == 1 and ents[0].dxftype() == "SPLINE":
+            single_closed_spline = bool(getattr(ents[0], "closed", False))
+        single_closed_polyline = False
+        if len(ents) == 1:
+            e0 = ents[0]
+            if e0.dxftype() == "LWPOLYLINE":
+                single_closed_polyline = bool(e0.closed)
+            elif e0.dxftype() == "POLYLINE":
+                single_closed_polyline = bool(getattr(e0, "is_closed", False))
+        closed = _infer_chain_closed(
+            pts,
+            spacing,
+            gap_threshold,
+            single_circle,
+            single_full_ellipse,
+            single_closed_spline,
+            single_closed_polyline,
+        )
         contours.append({"points": pts.copy(), "closed": closed, "dxftype": "+".join(types) if len(types) <= 3 else f"CHAIN[{len(types)}]"})
 
     return doc, contours
