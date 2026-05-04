@@ -331,7 +331,7 @@ def generate_contours_from_dxf(
     min_stitch_gap_mm: float = 1.0,
 ):
     """
-    Entity-order chains: merge LINE/ARC/CIRCLE/ELLIPSE on allowed layers until gap > threshold.
+    Entity-order chains: merge LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE on allowed layers until gap > threshold.
     Each new entity is oriented (forward vs reversed) so its start matches the previous tail when
     possible. Returns a list of dicts: {"points": (N,2) float array}.
 
@@ -352,7 +352,7 @@ def generate_contours_from_dxf(
 
     for entity in msp:
         dt = entity.dxftype()
-        if dt not in ("LINE", "ARC", "CIRCLE", "ELLIPSE"):
+        if dt not in ("LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE", "LWPOLYLINE", "POLYLINE"):
             continue
         if not _entity_layer_processed(doc, entity):
             # Startpoints (seam markers) are not cut geometry; skipping them must NOT break the
@@ -420,7 +420,7 @@ def generate_points_from_dxf(dxf_file, spacing):
     """
     Extract points from DXF: entity-order contours on allowed layers.
 
-    Vertex order along each contour follows stitched LINE/ARC/CIRCLE/ELLIPSE samples; when
+    Vertex order along each contour follows stitched LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE samples; when
     chaining entities, each segment is **reversed if needed** so its start matches the previous
     tail (CAD file order is not always head-to-tail). Do **not** run ``optimize_path`` on those points:
     angle-sort + nearest-neighbor reorders dense samples on a closed curve and produces long
