@@ -268,10 +268,22 @@ def interpolate_entity_xy(entity, spacing):
             x_shifted, y_shifted = x - center[0], y - center[1]
             rotated.append((-y_shifted + center[0], x_shifted + center[1]))
         return np.array(rotated, dtype=float)
+    if dt == "SPLINE":
+        return interpolate_spline(entity, spacing)
+    if dt in ("LWPOLYLINE", "POLYLINE"):
+        return interpolate_polyline(entity, spacing)
     return None
 
 
-def _infer_chain_closed(points, spacing, gap_threshold, single_circle, single_full_ellipse):
+def _infer_chain_closed(
+    points,
+    spacing,
+    gap_threshold,
+    single_circle,
+    single_full_ellipse,
+    single_closed_spline=False,
+    single_closed_polyline=False,
+):
     p = np.asarray(points, dtype=float)
     if len(p) < 3:
         return False
