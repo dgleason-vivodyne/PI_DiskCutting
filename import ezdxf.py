@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 import ezdxf
+from ezdxf.path import make_path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import CheckButtons
