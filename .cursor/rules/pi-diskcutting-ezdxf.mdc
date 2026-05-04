@@ -1,0 +1,10 @@
+---
+description: When editing DXF import and PVT export (import ezdxf.py)
+globs: "import ezdxf.py"
+alwaysApply: false
+---
+
+# `import ezdxf.py` touchpoints
+
+- Contour extraction, **SPLINE** / **LWPOLYLINE** / **POLYLINE** interpolation, delta vs absolute CSV, **`origin_xy_mm`** in meta JSON.
+- Keep behavior aligned with **DMS** `PointRelative` / chip-map expectations; avoid ad hoc frame fixes in this script — prefer documented meta + recipe on the DMS side.
