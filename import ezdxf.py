@@ -732,6 +732,39 @@ def build_export_segments_with_leads(
     return segs, replay, schedule
 
 
+def prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_origin_xy, spacing):
+    """
+    If the first motion vertex differs from CAD WCS ``cad_origin_xy`` (default (0,0)), prepend
+    straight **travel** segments from the origin to that vertex so the relative CSV includes the
+    full path from the drawing origin to the lead-in start. ``schedule`` gains a leading
+    (``travel``, 0, n) block (laser off). ``replay`` indices are shifted.
+
+    Meta ``origin_xy_mm`` should match ``cad_origin_xy`` (typically ``[0, 0]``). DMS chip map then
+    aligns **CAD WCS origin** to stage; legacy exports used non-zero origin instead of this prepend.
+    """
+    O = np.asarray(cad_origin_xy, dtype=float).reshape(2)
+    if len(segs) < 1:
+        return segs, replay, schedule
+    A = np.asarray(segs[0][0], dtype=float).reshape(2)
+    dist = float(np.linalg.norm(A - O))
+    if dist <= 1e-9:
+        return segs, replay, schedule
+
+    n_pre = max(1, int(np.ceil(dist / spacing))) if spacing > 1e-12 else 1
+    pts_pre = _sample_polyline_straight(O, A, n_pre)
+    pre_segs = []
+    for i in range(n_pre):
+        pre_segs.append((pts_pre[i].copy(), pts_pre[i + 1].copy()))
+    n0 = len(pre_segs)
+
+    new_segs = pre_segs + list(segs)
+    new_replay = {dst + n0: src + n0 for dst, src in replay.items()}
+    new_schedule = [("travel", 0, n0)] + [
+        (kind, lo + n0, hi + n0) for kind, lo, hi in schedule
+    ]
+    return new_segs, new_replay, new_schedule
+
+
 def generate_csv_from_points(
     points,
     output_filename,
