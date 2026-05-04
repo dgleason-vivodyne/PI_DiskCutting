@@ -784,10 +784,13 @@ def generate_csv_from_points(
     Writes a sibling ``*_absolute.csv`` with the same headers and motion order, **no** laser text
     rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
-    Writes a sibling ``<stem>.pvt.meta.json`` (same stem as the main CSV, e.g. ``foo_pvt.csv`` →
-    ``foo_pvt.pvt.meta.json``) with ``origin_xy_mm`` = DXF WCS (mm) at the **first export segment
-    start** (lead-in start). Delta PVT omits this rigid shift; DMS applies it before ``PointRelative``
-    when the meta file is present.
+    Prepends **travel** from CAD WCS (0,0) to the lead-in start when that point is not at the
+    origin, so the relative CSV contains the full in-plane path from the drawing origin.
+
+    Writes a sibling ``<stem>.pvt.meta.json`` with ``origin_xy_mm`` = ``[0, 0]`` (CAD WCS origin).
+    DMS adds this to chip-map XY so the stage targets **CAD (0,0)** for the chip; motion from
+    origin to lead-in is entirely in the CSV. Older hand-tuned ``PvtOffset*`` / legacy meta with
+    non-zero origin applied the lead-in offset only in software—prefer this export for clarity.
 
     Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
@@ -849,6 +852,11 @@ def generate_csv_from_points(
     if not segs:
         raise ValueError("No export segments (empty path).")
 
+    cad_o = (0.0, 0.0)
+    segs, replay, schedule = prepend_cad_wcs_origin_travel(
+        segs, replay, schedule, cad_o, spacing
+    )
+
     rel_rows = []
     for j in range(len(segs)):
         p0, p1 = segs[j]
@@ -899,8 +907,9 @@ def generate_csv_from_points(
         "schema_version": 1,
         "origin_xy_mm": [float(p0[0]), float(p0[1])],
         "description": (
-            "origin_xy_mm is DXF WCS (mm) at the first PVT segment start (lead-in start). "
-            "Relative CSV columns 2 and 4 are deltas; this origin is omitted there and applied by DMS when present."
+            "origin_xy_mm is CAD WCS (mm) at the start of the exported path — [0,0] after CAD-origin prepend. "
+            "Motion from origin to lead-in is included as travel rows in the relative CSV. "
+            "DMS adds origin_xy_mm to chip-map absolute XY (typically zero); chip map should place CAD (0,0) on stage."
         ),
         "max_velocity_mm_s": float(max_velocity),
         "max_acceleration_mm_s2": float(max_acceleration),
