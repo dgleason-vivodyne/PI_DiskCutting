@@ -3,7 +3,7 @@ import json
 import math
 import os
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 import ezdxf
 from ezdxf.path import make_path
@@ -461,11 +461,12 @@ def generate_points_from_dxf(dxf_file, spacing):
     Startpoints: **closed** contours get a **cyclic shift** so the vertex nearest the marker is
     first (still one continuous loop). **Open** contours only **reverse** if needed so the nearer
     **endpoint** is first—cyclic shifts are not used on open polylines (they would add an
-    artificial wrap jump mid-contour). Contours are concatenated in contour order (large moves
+    artificial wrap jump mid-contour).     Contours are concatenated in contour order (large moves
     between separate contours remain).
 
-    Returns ``(flat_points, contour_chunks)`` where ``contour_chunks`` is a list of ``(N,2)``
-    arrays used for laser on/off insertion in the CSV exporter.
+    Returns ``(flat_points, contour_chunks, contour_closed)`` where ``contour_chunks`` is a list of
+    ``(N,2)`` arrays used for laser on/off insertion in the CSV exporter, and ``contour_closed`` is
+    a parallel list of bools from DXF chain inference (used by optional travel-order optimization).
 
     ``dxf_file`` must be the path to the DXF on disk (e.g. from a file dialog when run as a script).
     """
@@ -473,10 +474,146 @@ def generate_points_from_dxf(dxf_file, spacing):
     doc, contours = generate_contours_from_dxf(dxf_file, spacing)
     apply_startpoint_seam_rotations(doc, contours)
     if not contours:
-        return np.empty((0, 2)), []
+        return np.empty((0, 2)), [], []
     chunks = [np.asarray(c["points"], dtype=float).copy() for c in contours]
+    closed_flags = [bool(c.get("closed", False)) for c in contours]
     flat = np.vstack(chunks)
-    return flat, chunks
+    return flat, chunks, closed_flags
+
+
+def _travel_variant_candidates_for_chunk(
+    pts: np.ndarray,
+    is_closed: bool,
+    spacing_mm: float,
+    max_seam_samples: int,
+):
+    """
+    Enumerate legal contour-level variants: cyclic shifts ± direction (closed) or forward/reverse (open).
+    Point spacing along the contour is unchanged — only start vertex and traversal direction.
+    """
+    p = np.asarray(pts, dtype=float)
+    if len(p) < 2:
+        return [p.copy()]
+    tol_close = max(float(spacing_mm) * 3.0, 0.05)
+
+    if not is_closed:
+        return [p.copy(), np.flipud(p).copy()]
+
+    if len(p) >= 2 and float(np.linalg.norm(p[0] - p[-1])) <= tol_close:
+        ring = p[:-1].copy()
+    else:
+        ring = p.copy()
+    m = len(ring)
+    if m < 3:
+        return [p.copy()]
+
+    n_k = min(m, max(6, int(max_seam_samples)))
+    ks = np.unique(np.linspace(0, m - 1, num=n_k, dtype=np.int64))
+    out = []
+    for k in ks:
+        k = int(k) % m
+        fwd = np.vstack([ring[k:], ring[:k]])
+        out.append(fwd.copy())
+        back_idx = np.array([(k - j) % m for j in range(m)], dtype=np.int64)
+        out.append(ring[back_idx].copy())
+    return out
+
+
+def optimize_contour_chunks_travel_greedy(
+    contour_chunks,
+    contour_closed,
+    *,
+    spacing_mm: float,
+    origin_xy=(0.0, 0.0),
+    max_seam_samples: int = 48,
+):
+    """
+    Reorder contours and choose seam (closed loops) and direction to shorten Euclidean rapid moves
+    from ``origin_xy`` and between successive contour ends. Uses a greedy nearest-contour/next-entry
+    heuristic (not globally optimal).
+
+    Does **not** resample geometry: only permutes whole contours and applies whole-chain reversal /
+    cyclic shifts for closed polylines.
+
+    Parameters
+    ----------
+    contour_chunks : list of (N,2) arrays
+    contour_closed : list of bool, same length as ``contour_chunks``
+    spacing_mm : float
+        DXF sample spacing (mm); used for duplicate closure detection tolerance only.
+    origin_xy : tuple
+        Rapid-move start (CAD WCS), typically ``(0, 0)`` matching prepend.
+    max_seam_samples : int
+        Max seam indices sampled around each closed contour (each yields forward + reverse traversal).
+
+    Returns
+    -------
+    list of (N,2) arrays
+        Reordered and transformed chunks to pass to ``flatten_contours_with_per_contour_overlap`` /
+        ``generate_csv_from_points``.
+    """
+    n = len(contour_chunks)
+    if n == 0:
+        return []
+    if len(contour_closed) != n:
+        raise ValueError("contour_closed must match contour_chunks length")
+
+    variants_per = [
+        _travel_variant_candidates_for_chunk(
+            contour_chunks[i],
+            bool(contour_closed[i]),
+            spacing_mm,
+            max_seam_samples,
+        )
+        for i in range(n)
+    ]
+
+    remaining = set(range(n))
+    ordered = []
+    current = np.asarray(origin_xy, dtype=float).reshape(2)
+
+    while remaining:
+        best_cost = float("inf")
+        best_var = None
+        best_i = None
+        for i in remaining:
+            for var in variants_per[i]:
+                if len(var) < 1:
+                    continue
+                ent = np.asarray(var[0], dtype=float).reshape(2)
+                d = float(np.linalg.norm(ent - current))
+                if d < best_cost:
+                    best_cost = d
+                    best_var = np.asarray(var, dtype=float).copy()
+                    best_i = i
+        if best_i is None:
+            break
+        ordered.append(best_var)
+        current = np.asarray(best_var[-1], dtype=float).reshape(2)
+        remaining.remove(best_i)
+
+    return ordered
+
+
+def prompt_optimize_contour_travel() -> bool:
+    """Tk yes/no: optionally optimize contour order / seam / direction for shorter rapid moves."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    try:
+        yes = messagebox.askyesno(
+            "Optimize air moves?",
+            "Optimize contour cutting order, seam position on closed loops, and cut direction\n"
+            "to shorten rapid moves? (Greedy heuristic from CAD origin — not globally optimal.)\n\n"
+            "Startpoints seam hints may be overridden when this option is enabled.",
+            icon="question",
+        )
+    finally:
+        root.destroy()
+    return bool(yes)
 
 
 def dedupe_consecutive_points(points, eps_mm):
