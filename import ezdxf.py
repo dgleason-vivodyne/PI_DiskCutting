@@ -1264,6 +1264,76 @@ def deltas_to_polyline(start_xy, deltas):
     return np.vstack([start_xy, start_xy + cum])
 
 
+def _motion_segment_kinds_from_schedule(schedule, n_segs):
+    """Map motion segment index -> schedule kind (``travel`` / ``lead_in`` / ``lead_out`` / ``cut``)."""
+    kinds = [None] * int(n_segs)
+    for kind, lo, hi in schedule:
+        lo = max(0, int(lo))
+        hi = min(int(hi), int(n_segs))
+        for j in range(lo, hi):
+            kinds[j] = kind
+    return kinds
+
+
+def _build_motion_segs_schedule_like_export(
+    points,
+    contour_chunks,
+    overlap_count,
+    spacing,
+    max_velocity,
+    max_acceleration,
+    travel_fillet_radius_mm,
+    travel_fillet_min_turn_deg,
+):
+    """
+    Rebuild ``(segs, schedule)`` the same way as ``generate_csv_from_points`` (including prepend),
+    for plot overlays. Returns ``([], [])`` if nothing to build.
+    """
+    fuzz = 0.001
+    overlap_n = max(0, int(overlap_count))
+    if contour_chunks is not None and len(contour_chunks) > 0:
+        chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), fuzz) for c in contour_chunks]
+        chunks_d = [c for c in chunks_d if len(c) >= 1]
+        if not chunks_d:
+            return [], []
+        full = flatten_contours_with_per_contour_overlap(contour_chunks, overlap_n, fuzz)
+        if len(full) < 1:
+            return [], []
+        starts = [0]
+        for c in chunks_d:
+            ext_len = len(c) + (min(overlap_n, len(c)) if overlap_n > 0 else 0)
+            starts.append(starts[-1] + ext_len)
+    else:
+        cc = dedupe_consecutive_points(np.asarray(points, dtype=float), fuzz)
+        if len(cc) < 1:
+            return [], []
+        if overlap_n > 0:
+            n_take = min(overlap_n, len(cc))
+            full = np.vstack([cc, cc[:n_take]])
+        else:
+            full = cc
+        starts = [0, len(full)]
+        chunks_d = [cc]
+
+    cad_o = (0.0, 0.0)
+    segs, replay, schedule = build_export_segments_with_leads(
+        full,
+        starts,
+        chunks_d,
+        overlap_n,
+        spacing,
+        max_velocity,
+        max_acceleration,
+        cad_origin_xy=cad_o,
+        travel_fillet_radius_mm=travel_fillet_radius_mm,
+        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
+    )
+    if not segs:
+        return [], []
+    segs, replay, schedule = prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_o)
+    return segs, schedule
+
+
 # Function to plot optimized path with velocity vectors
 def plot_points_with_velocity_vectors(
     points,
