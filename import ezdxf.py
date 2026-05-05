@@ -1401,76 +1401,6 @@ def deltas_to_polyline(start_xy, deltas):
     return np.vstack([start_xy, start_xy + cum])
 
 
-def _motion_segment_kinds_from_schedule(schedule, n_segs):
-    """Map motion segment index -> schedule kind (``travel`` / ``lead_in`` / ``lead_out`` / ``cut``)."""
-    kinds = [None] * int(n_segs)
-    for kind, lo, hi in schedule:
-        lo = max(0, int(lo))
-        hi = min(int(hi), int(n_segs))
-        for j in range(lo, hi):
-            kinds[j] = kind
-    return kinds
-
-
-def _build_motion_segs_schedule_like_export(
-    points,
-    contour_chunks,
-    overlap_count,
-    spacing,
-    max_velocity,
-    max_acceleration,
-    travel_fillet_radius_mm,
-    travel_fillet_min_turn_deg,
-):
-    """
-    Rebuild ``(segs, schedule)`` the same way as ``generate_csv_from_points`` (including prepend),
-    for plot overlays. Returns ``([], [])`` if nothing to build.
-    """
-    fuzz = 0.001
-    overlap_n = max(0, int(overlap_count))
-    if contour_chunks is not None and len(contour_chunks) > 0:
-        chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), fuzz) for c in contour_chunks]
-        chunks_d = [c for c in chunks_d if len(c) >= 1]
-        if not chunks_d:
-            return [], []
-        full = flatten_contours_with_per_contour_overlap(contour_chunks, overlap_n, fuzz)
-        if len(full) < 1:
-            return [], []
-        starts = [0]
-        for c in chunks_d:
-            ext_len = len(c) + (min(overlap_n, len(c)) if overlap_n > 0 else 0)
-            starts.append(starts[-1] + ext_len)
-    else:
-        cc = dedupe_consecutive_points(np.asarray(points, dtype=float), fuzz)
-        if len(cc) < 1:
-            return [], []
-        if overlap_n > 0:
-            n_take = min(overlap_n, len(cc))
-            full = np.vstack([cc, cc[:n_take]])
-        else:
-            full = cc
-        starts = [0, len(full)]
-        chunks_d = [cc]
-
-    cad_o = (0.0, 0.0)
-    segs, replay, schedule = build_export_segments_with_leads(
-        full,
-        starts,
-        chunks_d,
-        overlap_n,
-        spacing,
-        max_velocity,
-        max_acceleration,
-        cad_origin_xy=cad_o,
-        travel_fillet_radius_mm=travel_fillet_radius_mm,
-        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
-    )
-    if not segs:
-        return [], []
-    segs, replay, schedule = prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_o)
-    return segs, schedule
-
-
 # Function to plot optimized path with velocity vectors
 def plot_points_with_velocity_vectors(
     points,
@@ -1480,11 +1410,6 @@ def plot_points_with_velocity_vectors(
     csv_path=None,
     max_velocity=None,
     max_acceleration=None,
-    contour_chunks=None,
-    overlap_count: int = 0,
-    spacing: float = 0.01,
-    travel_fillet_radius_mm: float = 0.35,
-    travel_fillet_min_turn_deg: float = 25.0,
 ):
     """
     Plot DXF-derived polyline with optional velocity quivers and point indices.
@@ -1494,11 +1419,7 @@ def plot_points_with_velocity_vectors(
     export) so the overlay uses ``(0,0)``. If **both** are omitted, the overlay roots at
     ``points[0]`` (legacy CSV produced without CAD-origin prepend).
 
-    When ``csv_path`` is set and export parameters match (``contour_chunks``, ``overlap_count``,
-    ``spacing``, fillet knobs), segment endpoints for **non-cutting** motion (travel / lead-in /
-    lead-out) are labeled on the CSV polyline (``LI`` / ``LO`` / ``TR`` prefix + segment index).
-
-    Checkboxes toggle DXF path, CSV replay, quiver, DXF point labels, and NC transit labels.
+    Checkboxes toggle DXF path, CSV replay, quiver, and DXF point labels.
     """
     centroid = np.mean(points, axis=0)
 
@@ -1540,8 +1461,6 @@ def plot_points_with_velocity_vectors(
         label_objs.append(t)
 
     ln_csv = None
-    nc_label_objs = []
-    csv_xy = None
     if csv_path and os.path.isfile(csv_path):
         deltas = load_pvt_csv_segment_deltas(csv_path)
         if max_velocity is not None or max_acceleration is not None:
@@ -1561,68 +1480,13 @@ def plot_points_with_velocity_vectors(
             zorder=5,
         )
 
-        if max_velocity is not None and max_acceleration is not None:
-            segs_pl, sched_pl = _build_motion_segs_schedule_like_export(
-                points,
-                contour_chunks,
-                overlap_count,
-                spacing,
-                max_velocity,
-                max_acceleration,
-                travel_fillet_radius_mm,
-                travel_fillet_min_turn_deg,
-            )
-        else:
-            segs_pl, sched_pl = [], []
-
-        if (
-            len(segs_pl) > 0
-            and len(sched_pl) > 0
-            and len(deltas) == len(segs_pl)
-            and len(csv_xy) == len(deltas) + 1
-        ):
-            kinds = _motion_segment_kinds_from_schedule(sched_pl, len(segs_pl))
-            abbr = {"lead_in": "LI", "lead_out": "LO", "travel": "TR"}
-            colors_k = {"lead_in": "#6a0dad", "lead_out": "#8b4513", "travel": "#006400"}
-            ccsv = np.mean(csv_xy, axis=0)
-            off_nc = max(float(offset_distance), 0.08)
-            for j in range(len(segs_pl)):
-                k = kinds[j]
-                if k == "cut" or k is None:
-                    continue
-                xy = csv_xy[j + 1]
-                v = xy - ccsv
-                nv = float(np.linalg.norm(v))
-                if nv < 1e-9:
-                    v = np.array([1.0, 0.0], dtype=float)
-                else:
-                    v = v / nv
-                lbl = f"{abbr.get(k, '?')}{j}"
-                tnc = ax.text(
-                    float(xy[0]) + float(v[0]) * off_nc,
-                    float(xy[1]) + float(v[1]) * off_nc,
-                    lbl,
-                    fontsize=6,
-                    color=colors_k.get(k, "#333333"),
-                    ha="center",
-                    va="center",
-                    zorder=6,
-                    clip_on=True,
-                )
-                nc_label_objs.append(tnc)
-        elif len(segs_pl) > 0 and len(deltas) != len(segs_pl):
-            print(
-                "Note: NC transit labels skipped — CSV motion row count does not match "
-                f"rebuilt export ({len(deltas)} vs {len(segs_pl)}). Use matching export parameters."
-            )
-
     ax.set_xlabel("X Coordinate (mm)")
     ax.set_ylabel("Y Coordinate (mm)")
     ax.set_title("Path: DXF vs CSV replay (use checkboxes)")
     ax.set_aspect("equal", adjustable="box")
     ax.legend(loc="upper left", fontsize=8)
 
-    rax = plt.axes((0.80, 0.35, 0.18, 0.28))
+    rax = plt.axes((0.80, 0.45, 0.18, 0.22))
     check_labels = []
     actives = []
     toggle_map = []
@@ -1637,17 +1501,16 @@ def plot_points_with_velocity_vectors(
         toggle_map.append(("line", ln_csv))
 
     check_labels.append("Velocities")
-    actives.append(True)
+    actives.append(False)
     toggle_map.append(("quiv", quiv))
 
     check_labels.append("Point labels")
-    actives.append(True)
+    actives.append(False)
     toggle_map.append(("texts", label_objs))
 
-    if nc_label_objs:
-        check_labels.append("NC transit labels")
-        actives.append(True)
-        toggle_map.append(("texts", nc_label_objs))
+    quiv.set_visible(False)
+    for _t in label_objs:
+        _t.set_visible(False)
 
     chk = CheckButtons(rax, check_labels, actives)
 
@@ -1759,9 +1622,4 @@ if __name__ == '__main__':
         csv_path=output_csv,
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
-        contour_chunks=contour_chunks,
-        overlap_count=n_overlap,
-        spacing=spacing,
-        travel_fillet_radius_mm=travel_fillet_radius_mm,
-        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
     )
