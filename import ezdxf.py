@@ -1723,7 +1723,14 @@ if __name__ == '__main__':
     travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
-    optimized_points, contour_chunks = generate_points_from_dxf(dxf_file, spacing)
+    optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(dxf_file, spacing)
+    if prompt_optimize_contour_travel() and len(contour_chunks) > 0:
+        contour_chunks = optimize_contour_chunks_travel_greedy(
+            contour_chunks,
+            contour_closed,
+            spacing_mm=spacing,
+            origin_xy=(0.0, 0.0),
+        )
 
     overlap_count = prompt_overlap_point_count()
     n_overlap = int(overlap_count) if overlap_count > 0 else 0
