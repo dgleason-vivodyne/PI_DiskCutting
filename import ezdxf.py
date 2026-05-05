@@ -1343,6 +1343,11 @@ def plot_points_with_velocity_vectors(
     csv_path=None,
     max_velocity=None,
     max_acceleration=None,
+    contour_chunks=None,
+    overlap_count: int = 0,
+    spacing: float = 0.01,
+    travel_fillet_radius_mm: float = 0.35,
+    travel_fillet_min_turn_deg: float = 25.0,
 ):
     """
     Plot DXF-derived polyline with optional velocity quivers and point indices.
@@ -1352,7 +1357,11 @@ def plot_points_with_velocity_vectors(
     export) so the overlay uses ``(0,0)``. If **both** are omitted, the overlay roots at
     ``points[0]`` (legacy CSV produced without CAD-origin prepend).
 
-    Checkboxes toggle DXF path, CSV replay, quiver, and point labels.
+    When ``csv_path`` is set and export parameters match (``contour_chunks``, ``overlap_count``,
+    ``spacing``, fillet knobs), segment endpoints for **non-cutting** motion (travel / lead-in /
+    lead-out) are labeled on the CSV polyline (``LI`` / ``LO`` / ``TR`` prefix + segment index).
+
+    Checkboxes toggle DXF path, CSV replay, quiver, DXF point labels, and NC transit labels.
     """
     centroid = np.mean(points, axis=0)
 
@@ -1394,6 +1403,8 @@ def plot_points_with_velocity_vectors(
         label_objs.append(t)
 
     ln_csv = None
+    nc_label_objs = []
+    csv_xy = None
     if csv_path and os.path.isfile(csv_path):
         deltas = load_pvt_csv_segment_deltas(csv_path)
         if max_velocity is not None or max_acceleration is not None:
@@ -1413,33 +1424,107 @@ def plot_points_with_velocity_vectors(
             zorder=5,
         )
 
+        if max_velocity is not None and max_acceleration is not None:
+            segs_pl, sched_pl = _build_motion_segs_schedule_like_export(
+                points,
+                contour_chunks,
+                overlap_count,
+                spacing,
+                max_velocity,
+                max_acceleration,
+                travel_fillet_radius_mm,
+                travel_fillet_min_turn_deg,
+            )
+        else:
+            segs_pl, sched_pl = [], []
+
+        if (
+            len(segs_pl) > 0
+            and len(sched_pl) > 0
+            and len(deltas) == len(segs_pl)
+            and len(csv_xy) == len(deltas) + 1
+        ):
+            kinds = _motion_segment_kinds_from_schedule(sched_pl, len(segs_pl))
+            abbr = {"lead_in": "LI", "lead_out": "LO", "travel": "TR"}
+            colors_k = {"lead_in": "#6a0dad", "lead_out": "#8b4513", "travel": "#006400"}
+            ccsv = np.mean(csv_xy, axis=0)
+            off_nc = max(float(offset_distance), 0.08)
+            for j in range(len(segs_pl)):
+                k = kinds[j]
+                if k == "cut" or k is None:
+                    continue
+                xy = csv_xy[j + 1]
+                v = xy - ccsv
+                nv = float(np.linalg.norm(v))
+                if nv < 1e-9:
+                    v = np.array([1.0, 0.0], dtype=float)
+                else:
+                    v = v / nv
+                lbl = f"{abbr.get(k, '?')}{j}"
+                tnc = ax.text(
+                    float(xy[0]) + float(v[0]) * off_nc,
+                    float(xy[1]) + float(v[1]) * off_nc,
+                    lbl,
+                    fontsize=6,
+                    color=colors_k.get(k, "#333333"),
+                    ha="center",
+                    va="center",
+                    zorder=6,
+                    clip_on=True,
+                )
+                nc_label_objs.append(tnc)
+        elif len(segs_pl) > 0 and len(deltas) != len(segs_pl):
+            print(
+                "Note: NC transit labels skipped — CSV motion row count does not match "
+                f"rebuilt export ({len(deltas)} vs {len(segs_pl)}). Use matching export parameters."
+            )
+
     ax.set_xlabel("X Coordinate (mm)")
     ax.set_ylabel("Y Coordinate (mm)")
     ax.set_title("Path: DXF vs CSV replay (use checkboxes)")
     ax.set_aspect("equal", adjustable="box")
     ax.legend(loc="upper left", fontsize=8)
 
-    rax = plt.axes((0.80, 0.35, 0.18, 0.22))
-    check_labels = ["DXF path", "Velocities", "Point labels"]
-    actives = [True, True, True]
+    rax = plt.axes((0.80, 0.35, 0.18, 0.28))
+    check_labels = []
+    actives = []
+    toggle_map = []
+
+    check_labels.append("DXF path")
+    actives.append(True)
+    toggle_map.append(("line", ln_dxf))
+
     if ln_csv is not None:
-        check_labels.insert(1, "CSV replay")
-        actives.insert(1, True)
+        check_labels.append("CSV replay")
+        actives.append(True)
+        toggle_map.append(("line", ln_csv))
+
+    check_labels.append("Velocities")
+    actives.append(True)
+    toggle_map.append(("quiv", quiv))
+
+    check_labels.append("Point labels")
+    actives.append(True)
+    toggle_map.append(("texts", label_objs))
+
+    if nc_label_objs:
+        check_labels.append("NC transit labels")
+        actives.append(True)
+        toggle_map.append(("texts", nc_label_objs))
+
     chk = CheckButtons(rax, check_labels, actives)
 
     def on_check_click(_label):
         status = chk.get_status()
-        i = 0
-        ln_dxf.set_visible(status[i])
-        i += 1
-        if ln_csv is not None:
-            ln_csv.set_visible(status[i])
-            i += 1
-        quiv.set_visible(status[i])
-        i += 1
-        vis_labels = status[i]
-        for t in label_objs:
-            t.set_visible(vis_labels)
+        for i, (typ, ref) in enumerate(toggle_map):
+            vis = status[i]
+            if typ == "line":
+                ref.set_visible(vis)
+            elif typ == "quiv":
+                ref.set_visible(vis)
+            elif typ == "texts":
+                for t in ref:
+                    t.set_visible(vis)
         fig.canvas.draw_idle()
 
     chk.on_clicked(on_check_click)
