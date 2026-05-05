@@ -787,10 +787,11 @@ def generate_csv_from_points(
     Prepends **travel** from CAD WCS (0,0) to the lead-in start when that point is not at the
     origin, so the relative CSV contains the full in-plane path from the drawing origin.
 
-    Writes a sibling ``<stem>.pvt.meta.json`` with ``origin_xy_mm`` = ``[0, 0]`` (CAD WCS origin).
-    DMS adds this to chip-map XY so the stage targets **CAD (0,0)** for the chip; motion from
-    origin to lead-in is entirely in the CSV. Older hand-tuned ``PvtOffset*`` / legacy meta with
-    non-zero origin applied the lead-in offset only in software—prefer this export for clarity.
+    Writes ``<stem>.pvt.meta.json`` with ``origin_xy_mm`` = the first path vertex (``segs[0][0]``),
+    i.e. CAD WCS at path start — **``[0, 0]``** after prepend when the lead-in start was not
+    already at the origin. DMS adds this to chip-map XY (no-op for zeros). Motion from CAD origin
+    to lead-in is in the CSV as travel rows. Legacy: non-zero ``origin_xy_mm`` in meta and no
+    prepend; ``PvtOffset*`` was the manual analogue.
 
     Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
