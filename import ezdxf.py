@@ -175,16 +175,16 @@ def interpolate_spline(entity, spacing):
     """
     Sample a DXF SPLINE entity to a 2D polyline in WCS (mm).
 
-    Uses ezdxf adaptive ``Spline.flattening(distance)``: ``distance`` is the maximum
-    deviation from the true curve to the approximation chord (smaller ⇒ denser polyline).
-    We pass ``spacing`` as that tolerance so it tracks the same scale as other entities.
+    Uses ezdxf adaptive ``Spline.flattening(distance)`` to approximate the spline, then
+    re-densifies each resulting chord with ``spacing`` so point-to-point motion matches
+    the spacing-driven behavior used by other sampled entity types.
 
     Parameters
     ----------
     entity
         A DXF entity with dxftype ``SPLINE``.
     spacing : float
-        Flattening tolerance (mm); clamped to a small positive minimum.
+        Target segment spacing (mm); clamped to a small positive minimum.
 
     Returns
     -------
@@ -192,14 +192,24 @@ def interpolate_spline(entity, spacing):
     """
     if entity.dxftype() != "SPLINE":
         return None
-    tol = max(float(spacing), 1e-9)
+    step = max(float(spacing), 1e-9)
+    tol = step
     try:
         verts = list(entity.flattening(distance=tol))
     except (ValueError, AttributeError):
         return None
     if len(verts) < 2:
         return None
-    return np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
+    base = np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
+
+    dense = [base[0]]
+    for i in range(1, len(base)):
+        dense_seg = _chord_dense_samples(base[i - 1], base[i], step)
+        if len(dense_seg) > 0:
+            dense.extend(dense_seg)
+    if len(dense) < 2:
+        return None
+    return np.asarray(dense, dtype=float)
 
 
 def interpolate_polyline(entity, spacing):
