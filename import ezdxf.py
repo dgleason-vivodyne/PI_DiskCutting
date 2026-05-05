@@ -969,11 +969,10 @@ def plot_points_with_velocity_vectors(
     """
     Plot DXF-derived polyline with optional velocity quivers and point indices.
 
-    If ``csv_path`` is set, overlay cumulative CSV dx/dy from **CAD WCS (0,0)** to
-    match ``generate_csv_from_points`` (which prepends travel to the lead-in). Pass
-    the same ``max_velocity`` / ``max_acceleration`` as export when comparing to
-    DXF geometry. If ``max_velocity`` is omitted, the overlay roots at ``points[0]``
-    (legacy CSV without origin prepend).
+    If ``csv_path`` is set, overlay cumulative CSV dx/dy. Current exports start at **CAD (0,0)** —
+    pass **at least one** of ``max_velocity`` / ``max_acceleration`` (typically both, matching
+    export) so the overlay uses ``(0,0)``. If **both** are omitted, the overlay roots at
+    ``points[0]`` (legacy CSV produced without CAD-origin prepend).
 
     Checkboxes toggle DXF path, CSV replay, quiver, and point labels.
     """
@@ -1019,7 +1018,7 @@ def plot_points_with_velocity_vectors(
     ln_csv = None
     if csv_path and os.path.isfile(csv_path):
         deltas = load_pvt_csv_segment_deltas(csv_path)
-        if max_velocity is not None and max_acceleration is not None:
+        if max_velocity is not None or max_acceleration is not None:
             csv_start = np.array([0.0, 0.0], dtype=float)
         else:
             csv_start = np.asarray(points[0], dtype=float).reshape(2)
