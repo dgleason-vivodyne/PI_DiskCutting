@@ -1047,11 +1047,8 @@ def prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_origin_xy):
     if dist <= 1e-9:
         return segs, replay, schedule
 
-    n_pre = max(1, int(np.ceil(dist / spacing))) if spacing > 1e-12 else 1
-    pts_pre = _sample_polyline_straight(O, A, n_pre)
     pre_segs = []
-    for i in range(n_pre):
-        pre_segs.append((pts_pre[i].copy(), pts_pre[i + 1].copy()))
+    _append_straight_segment_single(pre_segs, O, A)
     n0 = len(pre_segs)
 
     new_segs = pre_segs + list(segs)
@@ -1070,19 +1067,25 @@ def generate_csv_from_points(
     contour_chunks=None,
     overlap_count: int = 0,
     spacing: float = 0.01,
+    travel_fillet_radius_mm: float = 0.35,
+    travel_fillet_min_turn_deg: float = 25.0,
 ):
     """
     Writes the main PVT CSV with laser I/O only around **cut** motion (not during lead-in/out or
-    travel). Lead-in/out length (mm) is ``v_max^2 / (2 a)``; each lead is sampled into
-    ``ceil(lead_mm / spacing)`` straight segments along entry/exit tangent. Inter-contour **travel**
-    is a straight chord from end of lead-out to start of the next contour's lead-in, sampled by
-    ``spacing``. ``0,0,0,0,0`` sync starts the file; relative file ends with laser-off rows.
+    travel). Lead-in/out keep a straight collinear segment of length ``v_max^2 / (2 a_tan)`` mm
+    immediately before/after the cut polyline. Non-cutting corners use an optional **fixed-radius**
+    symmetric fillet when the **path deflection** is at least ``travel_fillet_min_turn_deg``;
+    ``travel_fillet_radius_mm`` is clamped by local chord geometry. Shallower corners stay straight.
+    Cut polylines follow DXF sampling; non-cutting **arc** blends (lead-in, lead-out→travel, travel
+    at the next lead-in) use ``spacing`` along the arc; other non-cutting chords (origin prepend,
+    remaining straights) are single segments. Inter-contour motion is travel (laser off).
+    ``0,0,0,0,0`` sync starts the file; relative file ends with laser-off rows.
 
     Writes a sibling ``*_absolute.csv`` with the same headers and motion order, **no** laser text
     rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
-    Prepends **travel** from CAD WCS (0,0) to the lead-in start when that point is not at the
-    origin, so the relative CSV contains the full in-plane path from the drawing origin.
+    Prepends **travel** from CAD WCS (0,0) to the first motion vertex when that vertex is not at
+    the origin (one straight segment; arc blends use ``spacing`` where emitted).
 
     Writes ``<stem>.pvt.meta.json`` with ``origin_xy_mm`` = the first path vertex (``segs[0][0]``),
     i.e. CAD WCS at path start — **``[0, 0]``** after prepend when the lead-in start was not
@@ -1092,7 +1095,8 @@ def generate_csv_from_points(
 
     Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
-    ``spacing``: DXF point spacing (mm), used to set lead/travel segment counts.
+    ``spacing``: DXF sample spacing (mm) for cut geometry from entities; also chord spacing along
+    travel **arc** segments only (non-arc non-cutting chords stay single segments).
     """
     fuzz = 0.001
     overlap_n = max(0, int(overlap_count))
@@ -1144,16 +1148,23 @@ def generate_csv_from_points(
     else:
         abs_output_filename = output_filename + "_absolute.csv"
 
+    cad_o = (0.0, 0.0)
     segs, replay, schedule = build_export_segments_with_leads(
-        full, starts, chunks_d, overlap_n, spacing, max_velocity, max_acceleration
+        full,
+        starts,
+        chunks_d,
+        overlap_n,
+        spacing,
+        max_velocity,
+        max_acceleration,
+        cad_origin_xy=cad_o,
+        travel_fillet_radius_mm=travel_fillet_radius_mm,
+        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
     )
     if not segs:
         raise ValueError("No export segments (empty path).")
 
-    cad_o = (0.0, 0.0)
-    segs, replay, schedule = prepend_cad_wcs_origin_travel(
-        segs, replay, schedule, cad_o, spacing
-    )
+    segs, replay, schedule = prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_o)
 
     rel_rows = []
     for j in range(len(segs)):
