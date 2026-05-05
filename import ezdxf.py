@@ -655,24 +655,266 @@ def _sample_polyline_straight(p_from, p_to, n_seg):
     return (1.0 - t)[:, None] * p_from + t[:, None] * p_to
 
 
+def _append_straight_segment_single(segs, p0, p1):
+    """Append one straight segment from ``p0`` to ``p1`` (no spacing subdivision)."""
+    p0 = np.asarray(p0, dtype=float).reshape(2)
+    p1 = np.asarray(p1, dtype=float).reshape(2)
+    if float(np.linalg.norm(p1 - p0)) <= 1e-12:
+        return
+    segs.append((p0.copy(), p1.copy()))
+
+
+def _symmetric_fillet_T1_T2(P, u_chord_to_P, v_out, d):
+    """Corner ``P``; unit ``u_chord_to_P`` from anchor toward ``P``; unit ``v_out`` from ``P`` toward cut."""
+    u = np.asarray(u_chord_to_P, dtype=float).reshape(2)
+    v = np.asarray(v_out, dtype=float).reshape(2)
+    T1 = P - float(d) * u
+    T2 = P + float(d) * v
+    return T1, T2
+
+
+def _solve_travel_corner_fillet_fixed_radius(p_start, v_out, L, anchor, R_fixed_mm, theta_min_rad):
+    """
+    Symmetric circular fillet at extended corner P = p_start - (L+d)*v_out between chord
+    anchor->P and direction v_out. Uses **fixed** fillet radius ``R_fixed_mm`` (clamped by local
+    geometry).
+
+    Gating uses the **path deflection** ``beta = angle(u, v_out)`` where ``u`` is the unit chord
+    anchor->P (incoming direction into the corner). ``beta`` is 0 for collinear continuation and
+    ``pi`` for reversal; **no** arc when ``beta < theta_min_rad``. (Using ``acos(dot(-u,v_out))``
+    would compare ``pi - beta`` and invert shallow vs sharp turns.)
+
+    Tangent offsets along each leg use ``d = R * tan(beta/2)`` with ``R <= lc / tan(beta/2)``
+    (``lc`` = chord length anchor→P). **Do not** swap with ``R / tan(beta/2)`` — that breaks the
+    circle through ``T1``/``T2`` and shifts the cumulative path before the cut.
+
+    Keeps a straight of length L from T2 = p_start - L*v_out to p_start (cut).
+
+    Returns (P, d, R_use, u_chord, delta_arc_rad, T1, T2) where ``delta_arc_rad`` is the angle
+    between rays P->anchor and P->cut (for arc-center bisector), i.e. ``acos(dot(-u, v_out))``.
+    """
+    R_cap = max(float(R_fixed_mm), 0.0)
+    anchor = np.asarray(anchor, dtype=float).reshape(2)
+    v_out = _unit2d(v_out)
+    p_start = np.asarray(p_start, dtype=float).reshape(2)
+
+    def _no_fillet():
+        T2 = p_start - L * v_out
+        P0 = p_start - L * v_out
+        w = P0 - anchor
+        lc = float(np.linalg.norm(w))
+        if lc > 1e-9:
+            u = w / lc
+        else:
+            u = v_out.copy()
+        return P0, 0.0, 0.0, u, 0.0, T2.copy(), T2.copy()
+
+    if R_cap <= 1e-12:
+        return _no_fillet()
+
+    d = 0.0
+    for _ in range(8):
+        P = p_start - (L + d) * v_out
+        w = P - anchor
+        lc = float(np.linalg.norm(w))
+        if lc <= 1e-9:
+            return _no_fillet()
+        u = w / lc
+        cos_beta = float(np.clip(np.dot(u, v_out), -1.0, 1.0))
+        beta = float(math.acos(cos_beta))
+        if beta < float(theta_min_rad):
+            return _no_fillet()
+        th2 = 0.5 * beta
+        tan_h = math.tan(th2)
+        if tan_h < 1e-12:
+            return _no_fillet()
+        # Tangent offset along each leg: d = R * tan(beta/2); chord budget d <= lc => R <= lc / tan(beta/2).
+        R_geom = lc / tan_h
+        R_use = min(R_cap, R_geom)
+        d_new = R_use * tan_h
+        if abs(d_new - d) < 1e-9:
+            d = d_new
+            break
+        d = d_new
+
+    P = p_start - (L + d) * v_out
+    w = P - anchor
+    lc = float(np.linalg.norm(w))
+    if lc <= 1e-9:
+        return _no_fillet()
+    u = w / max(lc, 1e-15)
+    cos_beta = float(np.clip(np.dot(u, v_out), -1.0, 1.0))
+    beta = float(math.acos(cos_beta))
+    if beta < float(theta_min_rad):
+        return _no_fillet()
+    th2 = 0.5 * beta
+    tan_h = max(math.tan(th2), 1e-12)
+    R_geom = lc / tan_h
+    R_use = min(R_cap, R_geom)
+    if R_use <= 1e-12:
+        return _no_fillet()
+    d = R_use * tan_h
+    T1, T2 = _symmetric_fillet_T1_T2(P, u, v_out, d)
+    cos_delta = float(np.clip(np.dot(-u, v_out), -1.0, 1.0))
+    delta_arc = float(math.acos(cos_delta))
+    return P, d, R_use, u, delta_arc, T1, T2
+
+
+def _fillet_arc_center_from_corner(P_corner, u_chord_to_P, v_out, R, theta_rad):
+    """
+    Circle center for a symmetric fillet at corner ``P_corner`` between incoming direction
+    ``-u_chord_to_P`` (from corner toward anchor) and outgoing ``v_out``. Uses internal angle
+    bisector (stable vs offset-from-T1 construction).
+    """
+    u = _unit2d(u_chord_to_P)
+    v = _unit2d(v_out)
+    u_back = -u
+    th = max(float(theta_rad), 1e-12)
+    sh = math.sin(0.5 * th)
+    if sh < 1e-12:
+        return None
+    bis = u_back + v
+    nb = float(np.linalg.norm(bis))
+    if nb < 1e-12:
+        return None
+    bis = bis / nb
+    dist_cp = float(R) / sh
+    pc = np.asarray(P_corner, dtype=float).reshape(2)
+    return pc + dist_cp * bis
+
+
+def _travel_fillet_arc_points_on_circle(C, R, T1, T2, tol_mm=0.05):
+    """True if both tangent points sit on the nominal circle within ``tol_mm`` (radius sanity)."""
+    C = np.asarray(C, dtype=float).reshape(2)
+    rr = float(R)
+    if rr <= 1e-9:
+        return False
+    t1 = np.asarray(T1, dtype=float).reshape(2)
+    t2 = np.asarray(T2, dtype=float).reshape(2)
+    e1 = abs(float(np.linalg.norm(t1 - C)) - rr)
+    e2 = abs(float(np.linalg.norm(t2 - C)) - rr)
+    return max(e1, e2) <= float(tol_mm)
+
+
+def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing):
+    """
+    Circular arc from ``p_a`` to ``p_b`` on center ``C``, radius ``r``, minor sweep, densified.
+
+    Snaps the polyline to exact ``p_a`` / ``p_b`` endpoints so cumulative deltas match ``p_b - p_a``
+    even when ``atan2`` sampling drifts slightly from the true tangent points.
+    """
+    C = np.asarray(C, dtype=float).reshape(2)
+    a = np.asarray(p_a, dtype=float).reshape(2)
+    b = np.asarray(p_b, dtype=float).reshape(2)
+    rr = float(r)
+    if rr <= 1e-9:
+        _append_straight_segment_single(segs, a, b)
+        return
+    va = a - C
+    vb = b - C
+    ta = math.atan2(float(va[1]), float(va[0]))
+    tb = math.atan2(float(vb[1]), float(vb[0]))
+    phi = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
+    arc_len = abs(rr * phi)
+    step = max(float(spacing), 1e-9)
+    n = max(2, int(math.ceil(arc_len / step)))
+    prev = a.copy()
+    for i in range(1, n + 1):
+        t1 = i / n
+        if i == n:
+            p1_ = b.copy()
+        else:
+            ang1 = ta + phi * t1
+            p1_ = C + rr * np.array([math.cos(ang1), math.sin(ang1)], dtype=float)
+        segs.append((prev.copy(), p1_.copy()))
+        prev = p1_
+
+
+def _solve_lead_out_to_travel_fillet_at_E(
+    E, dir_out, L, u_travel_from_E, lc_travel_chord, R_fixed_mm, theta_min_rad
+):
+    """
+    Symmetric fillet at lead-out end ``E`` between incoming ray ``dir_out`` (into ``E``) and the
+    **first inter-contour travel chord** direction ``u_travel_from_E`` (unit vector from ``E`` toward
+    the virtual corner used by ``_solve_travel_corner_fillet_fixed_radius`` for the next lead-in).
+
+    Same gating and radius cap as other travel fillets: ``beta = angle(dir_out, u_travel_from_E)`` vs
+    ``theta_min_rad``, ``R_geom = min(L, lc_travel_chord) / tan(beta/2)``.
+
+    Returns ``(T1, T2, R_use, th_arc)`` or ``None`` if skipped.
+    """
+    R_cap = max(float(R_fixed_mm), 0.0)
+    if R_cap <= 1e-12:
+        return None
+    E = np.asarray(E, dtype=float).reshape(2)
+    lc_out = float(lc_travel_chord)
+    if lc_out <= 1e-9:
+        return None
+    w = _unit2d(u_travel_from_E)
+    u_in = _unit2d(dir_out)
+    cos_beta = float(np.clip(np.dot(u_in, w), -1.0, 1.0))
+    beta = float(math.acos(cos_beta))
+    if beta < float(theta_min_rad):
+        return None
+    th2 = 0.5 * beta
+    tan_h = max(math.tan(th2), 1e-12)
+    Lf = float(L)
+    if Lf <= 1e-12:
+        return None
+    R_geom = min(Lf, lc_out) / tan_h
+    R_use = min(R_cap, R_geom)
+    if R_use <= 1e-12:
+        return None
+    d = R_use * tan_h
+    if d > Lf + 1e-6 or d > lc_out + 1e-6:
+        return None
+    T1 = E - d * u_in
+    T2 = E + d * w
+    cos_delta = float(np.clip(np.dot(-u_in, w), -1.0, 1.0))
+    th_arc = float(math.acos(cos_delta))
+    return T1, T2, R_use, th_arc
+
+
 def build_export_segments_with_leads(
-    full, starts, chunks_d, overlap_n, spacing, max_velocity, max_acceleration
+    full,
+    starts,
+    chunks_d,
+    overlap_n,
+    spacing,
+    max_velocity,
+    max_acceleration,
+    cad_origin_xy=(0.0, 0.0),
+    travel_fillet_radius_mm: float = 0.35,
+    travel_fillet_min_turn_deg: float = 25.0,
 ):
     """
     Build ordered motion segments: per contour (lead-in -> cut polyline with overlap ->
-    lead-out), then straight travel to the next contour's lead-in start.
+    lead-out), then travel to the next contour's lead-in start.
+
+    Lead-in/out keep a straight collinear segment of length ``L = v_max^2/(2 a_tan)`` immediately
+    before/after the cut (the lead-out straight may stop short of nominal ``E`` when a
+    lead-out→travel fillet is emitted). Non-cutting corners (CAD origin approach, lead-out→chord
+    toward the next contour, travel at the next lead-in) may use a **small fixed-radius** symmetric
+    circular fillet when the **path deflection** at that vertex is at least
+    ``travel_fillet_min_turn_deg``; otherwise motion stays straight (allows modest accel jumps).
+    Fillet radius is ``min(travel_fillet_radius_mm, R_geom)`` with ``R_geom = lc / tan(beta/2)``
+    and tangent offset ``d = R * tan(beta/2)`` (``beta`` = path deflection, ``lc`` = local chord
+    budget on the relevant leg). ``spacing`` subdivides **fillet arc** motion only; other non-cutting
+    chords are single segments.
 
     Returns ``(segs, replay, schedule)`` where ``segs`` is a list of (p0, p1), ``replay`` maps
     destination segment index -> source index for overlap retrace, and ``schedule`` is a list of
     (kind, lo, hi) with hi exclusive segment indices into ``segs``.
     """
     L = _lead_length_mm(max_velocity, max_acceleration)
-    n_lead = max(1, int(np.ceil(L / spacing))) if spacing > 1e-12 else 1
+    theta_min_rad = math.radians(float(travel_fillet_min_turn_deg))
+    O = np.asarray(cad_origin_xy, dtype=float).reshape(2)
 
     segs = []
     replay = {}
     schedule = []
     k_count = len(chunks_d)
+    next_lead_anchor = O.copy()
 
     for k in range(k_count):
         V = full[starts[k] : starts[k + 1]]
