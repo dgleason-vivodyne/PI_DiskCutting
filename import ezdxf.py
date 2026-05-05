@@ -1581,7 +1581,9 @@ if __name__ == '__main__':
 
     spacing = 0.01  # Spacing between points (in mm)
     max_velocity = 100  # Max velocity (in mm/sec)
-    max_acceleration = 5000  # Max acceleration (in mm/s^2)
+    max_acceleration = 5000  # Max tangential acceleration (in mm/s^2)
+    travel_fillet_radius_mm = 0.35  # Non-cutting corner blend radius (mm); clamped by geometry
+    travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
     optimized_points, contour_chunks = generate_points_from_dxf(dxf_file, spacing)
@@ -1602,6 +1604,8 @@ if __name__ == '__main__':
         contour_chunks=contour_chunks,
         overlap_count=n_overlap,
         spacing=spacing,
+        travel_fillet_radius_mm=travel_fillet_radius_mm,
+        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
     )
 
     plot_points_with_velocity_vectors(
@@ -1611,4 +1615,9 @@ if __name__ == '__main__':
         csv_path=output_csv,
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
+        contour_chunks=contour_chunks,
+        overlap_count=n_overlap,
+        spacing=spacing,
+        travel_fillet_radius_mm=travel_fillet_radius_mm,
+        travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
     )
