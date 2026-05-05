@@ -925,16 +925,22 @@ def build_export_segments_with_leads(
             dir_in = _unit2d(V[1] - V[0])
             dir_out = _unit2d(V[-1] - V[-2])
         else:
-            u = np.array([1.0, 0.0], dtype=float)
-            dir_in = u
-            dir_out = u
+            uu = np.array([1.0, 0.0], dtype=float)
+            dir_in = uu
+            dir_out = uu
 
         p_start = V[0]
-        A = p_start - dir_in * L
-        pts_in = _sample_polyline_straight(A, p_start, n_lead)
         li_lo = len(segs)
-        for i in range(n_lead):
-            segs.append((pts_in[i].copy(), pts_in[i + 1].copy()))
+        _P, d_li, R_li, u_li, th_li, T1_li, T2_li = _solve_travel_corner_fillet_fixed_radius(
+            p_start, dir_in, L, next_lead_anchor, travel_fillet_radius_mm, theta_min_rad
+        )
+        if d_li > 1e-6 and R_li > 1e-6:
+            C_li = _fillet_arc_center_from_corner(_P, u_li, dir_in, R_li, th_li)
+            if C_li is None or not _travel_fillet_arc_points_on_circle(C_li, R_li, T1_li, T2_li):
+                _append_straight_segment_single(segs, T1_li, T2_li)
+            else:
+                _append_arc_segments_densified(segs, C_li, R_li, T1_li, T2_li, spacing)
+        _append_straight_segment_single(segs, T2_li, p_start)
         li_hi = len(segs)
         schedule.append(("lead_in", li_lo, li_hi))
 
@@ -956,40 +962,79 @@ def build_export_segments_with_leads(
 
         p_end = V[-1]
         E = p_end + dir_out * L
-        pts_out = _sample_polyline_straight(p_end, E, n_lead)
         lo_lo = len(segs)
-        for i in range(n_lead):
-            segs.append((pts_out[i].copy(), pts_out[i + 1].copy()))
+
+        travel_from = E
+        W_next = full[starts[k + 1] : starts[k + 2]] if k < k_count - 1 else []
+        has_next_contour = len(W_next) >= 1
+
+        if has_next_contour:
+            if len(W_next) >= 2:
+                dn = _unit2d(W_next[1] - W_next[0])
+            else:
+                dn = np.array([1.0, 0.0], dtype=float)
+            p_next = W_next[0]
+            _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
+                p_next,
+                dn,
+                L,
+                E,
+                travel_fillet_radius_mm,
+                theta_min_rad,
+            )
+            lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
+            lo_e_f = _solve_lead_out_to_travel_fillet_at_E(
+                E,
+                dir_out,
+                L,
+                u_tr0,
+                lc_travel,
+                travel_fillet_radius_mm,
+                theta_min_rad,
+            )
+            if lo_e_f is not None:
+                T1_e, T2_e, R_e, th_e = lo_e_f
+                _append_straight_segment_single(segs, p_end, T1_e)
+                C_e = _fillet_arc_center_from_corner(E, dir_out, u_tr0, R_e, th_e)
+                if C_e is None or not _travel_fillet_arc_points_on_circle(C_e, R_e, T1_e, T2_e):
+                    _append_straight_segment_single(segs, T1_e, T2_e)
+                else:
+                    _append_arc_segments_densified(segs, C_e, R_e, T1_e, T2_e, spacing)
+                travel_from = T2_e
+            else:
+                _append_straight_segment_single(segs, p_end, E)
+        else:
+            _append_straight_segment_single(segs, p_end, E)
+
         lo_hi = len(segs)
         schedule.append(("lead_out", lo_lo, lo_hi))
 
-        if k < k_count - 1:
-            W = full[starts[k + 1] : starts[k + 2]]
-            if len(W) < 1:
-                continue
-            if len(W) >= 2:
-                dn = _unit2d(W[1] - W[0])
-            else:
-                dn = np.array([1.0, 0.0], dtype=float)
-            A_next = W[0] - dn * L
-            dist = float(np.linalg.norm(A_next - E))
-            n_tr = max(1, int(np.ceil(dist / spacing))) if spacing > 1e-12 else 1
-            pts_tr = _sample_polyline_straight(E, A_next, n_tr)
+        if has_next_contour:
             tr_lo = len(segs)
-            for i in range(n_tr):
-                segs.append((pts_tr[i].copy(), pts_tr[i + 1].copy()))
+            _P_tr, d_tr, R_tr, u_tr, th_tr, T1_tr, T2_tr = _solve_travel_corner_fillet_fixed_radius(
+                p_next, dn, L, travel_from, travel_fillet_radius_mm, theta_min_rad
+            )
+            _append_straight_segment_single(segs, travel_from, T1_tr)
+            if d_tr > 1e-6 and R_tr > 1e-6:
+                C_tr = _fillet_arc_center_from_corner(_P_tr, u_tr, dn, R_tr, th_tr)
+                if C_tr is None or not _travel_fillet_arc_points_on_circle(C_tr, R_tr, T1_tr, T2_tr):
+                    _append_straight_segment_single(segs, T1_tr, T2_tr)
+                else:
+                    _append_arc_segments_densified(segs, C_tr, R_tr, T1_tr, T2_tr, spacing)
             tr_hi = len(segs)
             schedule.append(("travel", tr_lo, tr_hi))
+            next_lead_anchor = T2_tr.copy()
 
     return segs, replay, schedule
 
 
-def prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_origin_xy, spacing):
+def prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_origin_xy):
     """
     If the first motion vertex differs from CAD WCS ``cad_origin_xy`` (default (0,0)), prepend
-    straight **travel** segments from the origin to that vertex so the relative CSV includes the
-    full path from the drawing origin to the lead-in start. ``schedule`` gains a leading
-    (``travel``, 0, n) block (laser off). ``replay`` indices are shifted.
+    one straight **travel** segment from the origin to that vertex so the relative CSV includes the
+    full path from the drawing origin to the lead-in start (arc blends along the path use ``spacing``
+    elsewhere; this chord stays a single segment).
+    ``schedule`` gains a leading (``travel``, 0, n) block (laser off). ``replay`` indices are shifted.
 
     Meta ``origin_xy_mm`` should match ``cad_origin_xy`` (typically ``[0, 0]``). DMS chip map then
     aligns **CAD WCS origin** to stage; legacy exports used non-zero origin instead of this prepend.
