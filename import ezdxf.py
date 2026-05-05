@@ -956,19 +956,6 @@ def deltas_to_polyline(start_xy, deltas):
     return np.vstack([start_xy, start_xy + cum])
 
 
-def _pvt_csv_replay_start_xy(points, max_velocity, max_acceleration):
-    """Lead-in start before ``points[0]``; same geometry as ``build_export_segments_with_leads``."""
-    V = np.asarray(points, dtype=float)
-    if len(V) < 1:
-        return np.array([0.0, 0.0], dtype=float)
-    if len(V) >= 2:
-        dir_in = _unit2d(V[1] - V[0])
-    else:
-        dir_in = np.array([1.0, 0.0], dtype=float)
-    L = _lead_length_mm(max_velocity, max_acceleration)
-    return V[0] - dir_in * L
-
-
 # Function to plot optimized path with velocity vectors
 def plot_points_with_velocity_vectors(
     points,
