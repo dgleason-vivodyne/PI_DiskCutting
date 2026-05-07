@@ -659,7 +659,7 @@ def optimize_contour_chunks_travel_greedy(
     spacing_mm : float
         DXF sample spacing (mm); used for duplicate closure detection tolerance only.
     origin_xy : tuple
-        Rapid-move start (CAD WCS), typically ``(0, 0)`` matching prepend.
+        Rapid-move start (CAD WCS), typically ``(0, 0)`` for greedy ordering / seam choices.
     max_seam_samples : int
         Max seam indices sampled around each closed contour (each yields forward + reverse traversal).
 
@@ -883,6 +883,24 @@ def _segment_time_velocity(p0, p1, max_velocity, max_acceleration):
     if dist <= 1e-15 or dt <= 1e-15:
         return 0.0, 0.0, 0.0
     return dt, float((p1[0] - p0[0]) / dt), float((p1[1] - p0[1]) / dt)
+
+
+def _default_rapid_max_velocity_mm_s(max_velocity, max_acceleration, spacing_mm):
+    """
+    Peak speed scale for a spacing-sized chord under symmetric accel (triangle profile):
+    dt = sqrt(2*d/a), |v| = d/dt = sqrt(a*d/2). Matches typical cut-row speeds when d ≈ spacing.
+    """
+    d = max(float(spacing_mm), 1e-9)
+    v_like_cut = float(math.sqrt(max_acceleration * d / 2.0))
+    return float(min(max_velocity, v_like_cut))
+
+
+def _schedule_kind_at_segment_index(schedule, j):
+    """Return schedule kind (e.g. ``cut``, ``travel``) for segment index ``j``."""
+    for kind, lo, hi in schedule:
+        if lo <= j < hi:
+            return kind
+    raise IndexError(f"segment index {j} not covered by schedule")
 
 
 def _unit2d(v):
@@ -1296,37 +1314,6 @@ def build_export_segments_with_leads(
     return segs, replay, schedule
 
 
-def prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_origin_xy):
-    """
-    If the first motion vertex differs from CAD WCS ``cad_origin_xy`` (default (0,0)), prepend
-    one straight **travel** segment from the origin to that vertex so the relative CSV includes the
-    full path from the drawing origin to the lead-in start (arc blends along the path use ``spacing``
-    elsewhere; this chord stays a single segment).
-    ``schedule`` gains a leading (``travel``, 0, n) block (laser off). ``replay`` indices are shifted.
-
-    Meta ``origin_xy_mm`` should match ``cad_origin_xy`` (typically ``[0, 0]``). DMS chip map then
-    aligns **CAD WCS origin** to stage; legacy exports used non-zero origin instead of this prepend.
-    """
-    O = np.asarray(cad_origin_xy, dtype=float).reshape(2)
-    if len(segs) < 1:
-        return segs, replay, schedule
-    A = np.asarray(segs[0][0], dtype=float).reshape(2)
-    dist = float(np.linalg.norm(A - O))
-    if dist <= 1e-9:
-        return segs, replay, schedule
-
-    pre_segs = []
-    _append_straight_segment_single(pre_segs, O, A)
-    n0 = len(pre_segs)
-
-    new_segs = pre_segs + list(segs)
-    new_replay = {dst + n0: src + n0 for dst, src in replay.items()}
-    new_schedule = [("travel", 0, n0)] + [
-        (kind, lo + n0, hi + n0) for kind, lo, hi in schedule
-    ]
-    return new_segs, new_replay, new_schedule
-
-
 def generate_csv_from_points(
     points,
     output_filename,
@@ -1337,34 +1324,40 @@ def generate_csv_from_points(
     spacing: float = 0.01,
     travel_fillet_radius_mm: float = 0.35,
     travel_fillet_min_turn_deg: float = 25.0,
+    rapid_max_velocity_mm_s=None,
 ):
     """
     Writes the main PVT CSV with laser I/O only around **cut** motion (not during lead-in/out or
     travel). Lead-in/out keep a straight collinear segment of length ``v_max^2 / (2 a_tan)`` mm
-    immediately before/after the cut polyline. Non-cutting corners use an optional **fixed-radius**
+    flush against the cut (approach fillet before lead-in ``L``, exit ``L`` then travel fillet).
+    Non-cutting corners use an optional **fixed-radius**
     symmetric fillet when the **path deflection** is at least ``travel_fillet_min_turn_deg``;
     ``travel_fillet_radius_mm`` is clamped by local chord geometry. Shallower corners stay straight.
-    Cut polylines follow DXF sampling; non-cutting **arc** blends (lead-in, lead-out→travel, travel
-    at the next lead-in) use ``spacing`` along the arc; other non-cutting chords (origin prepend,
-    remaining straights) are single segments. Inter-contour motion is travel (laser off).
+    Cut polylines follow DXF sampling; non-cutting **arc** blends (lead-in, lead-out→travel including
+    on the final contour using a virtual lead-in at cut start, travel at the next lead-in) use ``spacing``
+    along the arc; remaining non-cutting straights are single
+    segments. Inter-contour motion is travel (laser off).
     ``0,0,0,0,0`` sync starts the file; relative file ends with laser-off rows.
 
     Writes a sibling ``*_absolute.csv`` with the same headers and motion order, **no** laser text
     rows, ``0,0,0,0,0`` at start and end; columns 2 and 4 are absolute endpoints ``Origin + p1``.
 
-    Prepends **travel** from CAD WCS (0,0) to the first motion vertex when that vertex is not at
-    the origin (one straight segment; arc blends use ``spacing`` where emitted).
-
-    Writes ``<stem>.pvt.meta.json`` with ``origin_xy_mm`` = the first path vertex (``segs[0][0]``),
-    i.e. CAD WCS at path start — **``[0, 0]``** after prepend when the lead-in start was not
-    already at the origin. DMS adds this to chip-map XY (no-op for zeros). Motion from CAD origin
-    to lead-in is in the CSV as travel rows. Legacy: non-zero ``origin_xy_mm`` in meta and no
-    prepend; ``PvtOffset*`` was the manual analogue.
+    Does **not** emit travel rows from CAD WCS ``(0,0)`` to the lead-in: the relative CSV begins at
+    the first motion segment (typically lead-in entry). ``<stem>.pvt.meta.json`` sets
+    ``origin_xy_mm`` to CAD WCS at that path start (``segs[0][0]``); DMS applies it as a stage
+    prelude after placing CAD ``(0,0)`` for buffers 1/2 (see ``LaserService.RunOnePvtInGlobalAsync``
+    and ``RunSinglePvtFromCurrentPositionAsync``).
 
     Overlap retrace (cut polyline only): repeated edges reuse the same PVT row as the first pass.
 
     ``spacing``: DXF sample spacing (mm) for cut geometry from entities; also chord spacing along
     travel **arc** segments only (non-arc non-cutting chords stay single segments).
+
+    ``rapid_max_velocity_mm_s``: Upper bound on speed magnitude used for **lead-in**, **lead-out**,
+    and **travel** rows (same ``max_acceleration``). **Cut** segments always use ``max_velocity``.
+    If ``None``, defaults to ``min(max_velocity, sqrt(max_acceleration * spacing / 2))``, i.e. the
+    peak speed of a spacing-sized symmetric-accel move — similar to dense cut sampling so long
+    travel chords do not cruise at full ``max_velocity``. Pass a positive float to override.
     """
     fuzz = 0.001
     overlap_n = max(0, int(overlap_count))
@@ -1432,12 +1425,20 @@ def generate_csv_from_points(
     if not segs:
         raise ValueError("No export segments (empty path).")
 
-    segs, replay, schedule = prepend_cad_wcs_origin_travel(segs, replay, schedule, cad_o)
+    if rapid_max_velocity_mm_s is None:
+        rapid_v = _default_rapid_max_velocity_mm_s(max_velocity, max_acceleration, spacing)
+    else:
+        rapid_v = float(rapid_max_velocity_mm_s)
+        if rapid_v <= 0:
+            raise ValueError("rapid_max_velocity_mm_s must be positive")
+        rapid_v = min(rapid_v, float(max_velocity))
 
     rel_rows = []
     for j in range(len(segs)):
         p0, p1 = segs[j]
-        dt, vx, vy = _segment_time_velocity(p0, p1, max_velocity, max_acceleration)
+        kind = _schedule_kind_at_segment_index(schedule, j)
+        v_cap = float(max_velocity) if kind == "cut" else rapid_v
+        dt, vx, vy = _segment_time_velocity(p0, p1, v_cap, max_acceleration)
         dx = float(p1[0] - p0[0])
         dy = float(p1[1] - p0[1])
         rel_rows.append((dt, dx, vx, dy, vy))
@@ -1484,11 +1485,13 @@ def generate_csv_from_points(
         "schema_version": 1,
         "origin_xy_mm": [float(p0[0]), float(p0[1])],
         "description": (
-            "origin_xy_mm is CAD WCS (mm) at the start of the exported path — [0,0] after CAD-origin prepend. "
-            "Motion from origin to lead-in is included as travel rows in the relative CSV. "
-            "DMS adds origin_xy_mm to chip-map absolute XY (typically zero); chip map should place CAD (0,0) on stage."
+            "origin_xy_mm is CAD WCS (mm) at the start of the first motion segment (typically lead-in entry). "
+            "No travel rows from CAD (0,0) in the relative CSV; DMS applies this offset as a stage prelude "
+            "after MoveTo chip-map XY for buffers 1/2 (RunOnePvtInGlobalAsync) or with PvtOffset in "
+            "RunSinglePvtFromCurrentPositionAsync."
         ),
         "max_velocity_mm_s": float(max_velocity),
+        "rapid_max_velocity_mm_s": rapid_v,
         "max_acceleration_mm_s2": float(max_acceleration),
         "spacing_mm": float(spacing),
         "relative_csv_columns": ["time_s", "delta_x_mm", "vx_mm_s", "delta_y_mm", "vy_mm_s"],
