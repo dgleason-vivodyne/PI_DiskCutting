@@ -1393,16 +1393,23 @@ def build_export_segments_with_leads(
 
         p_start = V[0]
         li_lo = len(segs)
-        _P, d_li, R_li, u_li, th_li, T1_li, T2_li = _solve_travel_corner_fillet_fixed_radius(
-            p_start, dir_in, L, next_lead_anchor, travel_fillet_radius_mm, theta_min_rad
-        )
-        if d_li > 1e-6 and R_li > 1e-6:
-            C_li = _fillet_arc_center_from_corner(_P, u_li, dir_in, R_li, th_li)
-            if C_li is None or not _travel_fillet_arc_points_on_circle(C_li, R_li, T1_li, T2_li):
-                _append_straight_segment_single(segs, T1_li, T2_li)
-            else:
-                _append_arc_segments_densified(segs, C_li, R_li, T1_li, T2_li, spacing)
-        _append_straight_segment_single(segs, T2_li, p_start)
+        B_exp = p_start - L * dir_in
+        anchor_snap_tol = max(0.05, float(spacing) * 10.0)
+        if float(np.linalg.norm(next_lead_anchor - B_exp)) <= anchor_snap_tol:
+            _append_straight_segment_single(segs, next_lead_anchor, p_start)
+        else:
+            _P, d_li, R_li, u_li, th_li, T1_li, T2_li = _solve_travel_corner_fillet_fixed_radius(
+                p_start, dir_in, L, next_lead_anchor, travel_fillet_radius_mm, theta_min_rad
+            )
+            if d_li > 1e-6 and R_li > 1e-6:
+                C_li = _fillet_arc_center_from_corner(_P, u_li, dir_in, R_li, th_li)
+                if C_li is None or not _travel_fillet_arc_points_on_circle(C_li, R_li, T1_li, T2_li):
+                    _append_straight_segment_single(segs, T1_li, T2_li)
+                else:
+                    li_chord = np.asarray(T1_li, dtype=float).reshape(2) - np.asarray(next_lead_anchor, dtype=float).reshape(2)
+                    li_tan = li_chord if float(np.linalg.norm(li_chord)) > 1e-9 else None
+                    _append_arc_segments_densified(segs, C_li, R_li, T1_li, T2_li, spacing, tangent_from_a=li_tan)
+            _append_straight_segment_single(segs, T2_li, p_start)
         li_hi = len(segs)
         schedule.append(("lead_in", li_lo, li_hi))
 
@@ -1426,9 +1433,15 @@ def build_export_segments_with_leads(
         E = p_end + dir_out * L
         lo_lo = len(segs)
 
-        travel_from = E
         W_next = full[starts[k + 1] : starts[k + 2]] if k < k_count - 1 else []
         has_next_contour = len(W_next) >= 1
+
+        _append_straight_segment_single(segs, p_end, E)
+        lo_hi_lead = len(segs)
+
+        tr_lo = 0
+        tr_hi = 0
+        did_travel = False
 
         if has_next_contour:
             if len(W_next) >= 2:
@@ -1436,55 +1449,74 @@ def build_export_segments_with_leads(
             else:
                 dn = np.array([1.0, 0.0], dtype=float)
             p_next = W_next[0]
-        else:
-            # Virtual next lead-in at this contour's entry (same p_start / dir_in) so the final
-            # lead-out still gets a travel-style fillet when there is no following contour.
-            p_next = np.asarray(p_start, dtype=float).reshape(2).copy()
-            dn = dir_in.copy()
 
-        _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
-            p_next,
-            dn,
-            L,
-            E,
-            travel_fillet_radius_mm,
-            theta_min_rad,
-        )
-        lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
-        _append_straight_segment_single(segs, p_end, E)
-        lo_arc = _solve_lead_out_arc_after_decel_straight(
-            E,
-            dir_out,
-            u_tr0,
-            lc_travel,
-            travel_fillet_radius_mm,
-            theta_min_rad,
-        )
-        if lo_arc is not None:
-            C_e, R_e, T2_e = lo_arc
-            _append_arc_segments_densified(segs, C_e, R_e, E, T2_e, spacing)
-            travel_from = T2_e
-        else:
-            travel_from = E
-
-        lo_hi = len(segs)
-        schedule.append(("lead_out", lo_lo, lo_hi))
-
-        if has_next_contour:
             tr_lo = len(segs)
-            _P_tr, d_tr, R_tr, u_tr, th_tr, T1_tr, T2_tr = _solve_travel_corner_fillet_fixed_radius(
-                p_next, dn, L, travel_from, travel_fillet_radius_mm, theta_min_rad
+            ok_u, B_anchor = _try_append_unified_inter_contour_transition(
+                segs,
+                E,
+                dir_out,
+                p_next,
+                dn,
+                L,
+                travel_fillet_radius_mm,
+                theta_min_rad,
+                spacing,
             )
-            _append_straight_segment_single(segs, travel_from, T1_tr)
-            if d_tr > 1e-6 and R_tr > 1e-6:
-                C_tr = _fillet_arc_center_from_corner(_P_tr, u_tr, dn, R_tr, th_tr)
-                if C_tr is None or not _travel_fillet_arc_points_on_circle(C_tr, R_tr, T1_tr, T2_tr):
-                    _append_straight_segment_single(segs, T1_tr, T2_tr)
+            if ok_u and B_anchor is not None:
+                tr_hi = len(segs)
+                next_lead_anchor = np.asarray(B_anchor, dtype=float).reshape(2).copy()
+                did_travel = True
+            else:
+                travel_from = E
+                _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
+                    p_next,
+                    dn,
+                    L,
+                    E,
+                    travel_fillet_radius_mm,
+                    theta_min_rad,
+                )
+                lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
+                lo_arc = _solve_lead_out_arc_after_decel_straight(
+                    E,
+                    dir_out,
+                    u_tr0,
+                    lc_travel,
+                    travel_fillet_radius_mm,
+                    theta_min_rad,
+                    chord_extra_mm=travel_fillet_chord_extra_mm,
+                    chord_fraction=travel_fillet_chord_fraction,
+                    arc_length_max_mm=travel_fillet_lead_out_arc_length_max_mm,
+                )
+                if lo_arc is not None:
+                    C_e, R_e, T2_e = lo_arc
+                    _append_arc_segments_densified(segs, C_e, R_e, E, T2_e, spacing, tangent_from_a=dir_out)
+                    travel_from = T2_e
                 else:
-                    _append_arc_segments_densified(segs, C_tr, R_tr, T1_tr, T2_tr, spacing)
-            tr_hi = len(segs)
+                    travel_from = E
+
+                lo_hi_lead = len(segs)
+
+                tr_lo = len(segs)
+                _P_tr, d_tr, R_tr, u_tr, th_tr, T1_tr, T2_tr = _solve_travel_corner_fillet_fixed_radius(
+                    p_next, dn, L, travel_from, travel_fillet_radius_mm, theta_min_rad
+                )
+                _append_straight_segment_single(segs, travel_from, T1_tr)
+                if d_tr > 1e-6 and R_tr > 1e-6:
+                    C_tr = _fillet_arc_center_from_corner(_P_tr, u_tr, dn, R_tr, th_tr)
+                    if C_tr is None or not _travel_fillet_arc_points_on_circle(C_tr, R_tr, T1_tr, T2_tr):
+                        _append_straight_segment_single(segs, T1_tr, T2_tr)
+                    else:
+                        tr_chord = np.asarray(T1_tr, dtype=float).reshape(2) - np.asarray(travel_from, dtype=float).reshape(2)
+                        tr_tan = tr_chord if float(np.linalg.norm(tr_chord)) > 1e-9 else None
+                        _append_arc_segments_densified(segs, C_tr, R_tr, T1_tr, T2_tr, spacing, tangent_from_a=tr_tan)
+                tr_hi = len(segs)
+                next_lead_anchor = T2_tr.copy()
+                did_travel = True
+
+        schedule.append(("lead_out", lo_lo, lo_hi_lead))
+        if did_travel:
             schedule.append(("travel", tr_lo, tr_hi))
-            next_lead_anchor = T2_tr.copy()
 
     return segs, replay, schedule
 
