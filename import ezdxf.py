@@ -775,6 +775,10 @@ def optimize_contour_chunks_travel_greedy(
     remaining = set(range(n))
     ordered = []
     current = np.asarray(origin_xy, dtype=float).reshape(2)
+    use_lead = lead_straight_mm is not None
+    L_g = max(0.0, float(lead_straight_mm)) if use_lead else 0.0
+    theta_min_rad = math.radians(float(travel_fillet_min_turn_deg))
+    prev_dir_out = None
 
     while remaining:
         best_cost = float("inf")
@@ -784,16 +788,46 @@ def optimize_contour_chunks_travel_greedy(
             for var in variants_per[i]:
                 if len(var) < 1:
                     continue
-                ent = np.asarray(var[0], dtype=float).reshape(2)
-                d = float(np.linalg.norm(ent - current))
+                var = np.asarray(var, dtype=float)
+                if use_lead:
+                    ent = _travel_polyline_lead_entry_xy(var, L_g)
+                    if len(var) >= 2:
+                        dir_in_c = _unit2d(var[1] - var[0])
+                    else:
+                        dir_in_c = np.array([1.0, 0.0], dtype=float)
+                    base = float(np.linalg.norm(ent - current))
+                    if prev_dir_out is None:
+                        d = base
+                    else:
+                        pen = _greedy_transition_arc_penalty_mm(
+                            current,
+                            prev_dir_out,
+                            ent,
+                            dir_in_c,
+                            theta_min_rad=theta_min_rad,
+                            unified_fail_penalty_mm=greedy_unified_fail_penalty_mm,
+                            sharp_turn_penalty_mm_per_rad=greedy_sharp_turn_penalty_mm_per_rad,
+                        )
+                        d = base + pen
+                else:
+                    ent = np.asarray(var[0], dtype=float).reshape(2)
+                    d = float(np.linalg.norm(ent - current))
                 if d < best_cost:
                     best_cost = d
-                    best_var = np.asarray(var, dtype=float).copy()
+                    best_var = var.copy()
                     best_i = i
         if best_i is None:
             break
         ordered.append(best_var)
-        current = np.asarray(best_var[-1], dtype=float).reshape(2)
+        if use_lead:
+            current = _travel_polyline_lead_exit_xy(best_var, L_g)
+            if len(best_var) >= 2:
+                prev_dir_out = _unit2d(best_var[-1] - best_var[-2])
+            else:
+                prev_dir_out = np.array([1.0, 0.0], dtype=float)
+        else:
+            current = np.asarray(best_var[-1], dtype=float).reshape(2)
+            prev_dir_out = None
         remaining.remove(best_i)
 
     return ordered
