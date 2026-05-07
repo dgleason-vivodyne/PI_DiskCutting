@@ -1526,6 +1526,27 @@ def load_pvt_csv_segment_deltas(csv_path):
     return np.asarray(deltas, dtype=float)
 
 
+def try_read_origin_xy_mm_from_pvt_meta(csv_path):
+    """CAD WCS ``origin_xy_mm`` from sibling ``<stem>.pvt.meta.json`` if ``schema_version`` is 1; else ``None``."""
+    if not csv_path:
+        return None
+    stem = csv_path[:-4] if csv_path.lower().endswith(".csv") else csv_path
+    meta_path = stem + ".pvt.meta.json"
+    if not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            root = json.load(f)
+        if int(root.get("schema_version", -1)) != 1:
+            return None
+        arr = root.get("origin_xy_mm")
+        if not isinstance(arr, list) or len(arr) < 2:
+            return None
+        return [float(arr[0]), float(arr[1])]
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def deltas_to_polyline(start_xy, deltas):
     """start_xy (2,), deltas (N, 2) -> (N + 1, 2) polyline including start (cumulative CSV path)."""
     start_xy = np.asarray(start_xy, dtype=float).reshape(2)
@@ -1548,10 +1569,9 @@ def plot_points_with_velocity_vectors(
     """
     Plot DXF-derived polyline with optional velocity quivers and point indices.
 
-    If ``csv_path`` is set, overlay cumulative CSV dx/dy. Current exports start at **CAD (0,0)** —
-    pass **at least one** of ``max_velocity`` / ``max_acceleration`` (typically both, matching
-    export) so the overlay uses ``(0,0)``. If **both** are omitted, the overlay roots at
-    ``points[0]`` (legacy CSV produced without CAD-origin prepend).
+    If ``csv_path`` is set, overlay cumulative CSV dx/dy. The polyline starts at ``origin_xy_mm``
+    from sibling ``.pvt.meta.json`` when present; otherwise at ``(0,0)`` if dynamics args are set,
+    else ``points[0]``.
 
     Checkboxes toggle DXF path, CSV replay, quiver, and DXF point labels.
     """
@@ -1597,7 +1617,10 @@ def plot_points_with_velocity_vectors(
     ln_csv = None
     if csv_path and os.path.isfile(csv_path):
         deltas = load_pvt_csv_segment_deltas(csv_path)
-        if max_velocity is not None or max_acceleration is not None:
+        meta_o = try_read_origin_xy_mm_from_pvt_meta(csv_path)
+        if meta_o is not None:
+            csv_start = np.asarray(meta_o, dtype=float).reshape(2)
+        elif max_velocity is not None or max_acceleration is not None:
             csv_start = np.array([0.0, 0.0], dtype=float)
         else:
             csv_start = np.asarray(points[0], dtype=float).reshape(2)
