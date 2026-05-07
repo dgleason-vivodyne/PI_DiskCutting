@@ -709,6 +709,10 @@ def optimize_contour_chunks_travel_greedy(
     spacing_mm: float,
     origin_xy=(0.0, 0.0),
     max_seam_samples: int = 48,
+    lead_straight_mm: float | None = None,
+    travel_fillet_min_turn_deg: float = 25.0,
+    greedy_unified_fail_penalty_mm: float = 100.0,
+    greedy_sharp_turn_penalty_mm_per_rad: float = 10.0,
 ):
     """
     Reorder contours and choose seam (closed loops) and direction to shorten Euclidean rapid moves
@@ -717,6 +721,14 @@ def optimize_contour_chunks_travel_greedy(
 
     Does **not** resample geometry: only permutes whole contours and applies whole-chain reversal /
     cyclic shifts for closed polylines.
+
+    When ``lead_straight_mm`` is set (typically ``L = v_max^2 / (2 a)`` from ``_lead_length_mm``),
+    distances use the same **lead-in / lead-out anchors** as ``build_export_segments_with_leads``, and
+    an extra penalty discourages variants where unified travel would fail (``t_hit < 0`` → legacy arc
+    stacks) or where the non-cutting corner angle exceeds ``travel_fillet_min_turn_deg`` (sharp blends).
+
+    When ``lead_straight_mm`` is ``None``, the legacy metric uses raw cut endpoints only (no transition
+    penalties).
 
     Parameters
     ----------
@@ -728,6 +740,15 @@ def optimize_contour_chunks_travel_greedy(
         Rapid-move start (CAD WCS), typically ``(0, 0)`` for greedy ordering / seam choices.
     max_seam_samples : int
         Max seam indices sampled around each closed contour (each yields forward + reverse traversal).
+    lead_straight_mm : float or None
+        Lead length ``L`` (mm) for ``B`` / ``E`` anchors; ``None`` selects legacy endpoint-only costing.
+    travel_fillet_min_turn_deg : float
+        Same semantic as export ``travel_fillet_min_turn_deg`` — turns shallower than this are straight.
+    greedy_unified_fail_penalty_mm : float
+        Added cost when exit/approach rays place the infinite-line intersection **behind** ``E``
+        (unified transition unavailable).
+    greedy_sharp_turn_penalty_mm_per_rad : float
+        Cost multiplier on ``max(0, ψ − θ_min)`` when a filleted corner would replace straight motion.
 
     Returns
     -------
