@@ -1068,9 +1068,44 @@ def _travel_fillet_arc_points_on_circle(C, R, T1, T2, tol_mm=0.05):
     return max(e1, e2) <= float(tol_mm)
 
 
-def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing):
+def _choose_arc_sweep_align_tangent_at_a(ta: float, tb: float, tangent_from_a: np.ndarray) -> float:
     """
-    Circular arc from ``p_a`` to ``p_b`` on center ``C``, radius ``r``, minor sweep, densified.
+    Two sweeps connect angles ``ta`` and ``tb`` on a circle; pick the one whose motion **leaving**
+    ``p_a`` matches ``tangent_from_a`` (unit-ish vector in the motion direction along the arc).
+    Falls back to the shorter sweep when ambiguous.
+    """
+    tgt = _unit2d(tangent_from_a)
+    phi0 = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
+    candidates = [phi0]
+    if abs(phi0) > 1e-12:
+        phi1 = phi0 - 2.0 * math.pi * (1.0 if phi0 > 0.0 else -1.0)
+        candidates.append(phi1)
+
+    def leaving_dir(phi: float) -> np.ndarray:
+        # theta runs from ta toward ta+phi; CCW tangent at ta is (-sin ta, cos ta)
+        ccw = np.array([-math.sin(ta), math.cos(ta)], dtype=float)
+        if phi >= 0.0:
+            return ccw
+        return -ccw
+
+    best_phi = phi0
+    best_dot = -2.0
+    for phi in candidates:
+        d0 = leaving_dir(phi)
+        sc = float(np.dot(d0, tgt))
+        if sc > best_dot + 1e-12:
+            best_dot = sc
+            best_phi = phi
+    return float(best_phi)
+
+
+def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing, tangent_from_a=None):
+    """
+    Circular arc from ``p_a`` to ``p_b`` on center ``C``, radius ``r``, densified.
+
+    By default uses the **shorter** angular sweep. If ``tangent_from_a`` is set (preferred direction
+    of motion **leaving** ``p_a`` along the arc), chooses between the two sweeps so that starting
+    tangent best aligns — avoids a ~180° hook when the minor sweep runs backward (seen on lead-out).
 
     Snaps the polyline to exact ``p_a`` / ``p_b`` endpoints so cumulative deltas match ``p_b - p_a``
     even when ``atan2`` sampling drifts slightly from the true tangent points.
@@ -1086,7 +1121,10 @@ def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing):
     vb = b - C
     ta = math.atan2(float(va[1]), float(va[0]))
     tb = math.atan2(float(vb[1]), float(vb[0]))
-    phi = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
+    if tangent_from_a is None:
+        phi = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
+    else:
+        phi = _choose_arc_sweep_align_tangent_at_a(ta, tb, tangent_from_a)
     arc_len = abs(rr * phi)
     step = max(float(spacing), 1e-9)
     n = max(2, int(math.ceil(arc_len / step)))
