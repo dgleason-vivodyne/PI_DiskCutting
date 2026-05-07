@@ -298,7 +298,7 @@ def _infer_chain_closed(
     p = np.asarray(points, dtype=float)
     if len(p) < 3:
         return False
-    if single_circle:
+    if single_circle: 
         return True
     if single_full_ellipse:
         return True
