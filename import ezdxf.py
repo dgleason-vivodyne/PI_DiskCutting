@@ -636,6 +636,72 @@ def _travel_variant_candidates_for_chunk(
     return out
 
 
+def _travel_polyline_lead_entry_xy(var: np.ndarray, lead_straight_mm: float) -> np.ndarray:
+    """Collinear lead-in anchor ``B = p_start - L dir_in`` (matches ``build_export_segments_with_leads``)."""
+    p = np.asarray(var, dtype=float)
+    if len(p) < 2:
+        return np.asarray(p[0], dtype=float).reshape(2).copy()
+    L = float(lead_straight_mm)
+    dir_in = _unit2d(p[1] - p[0])
+    return (p[0] - L * dir_in).reshape(2).copy()
+
+
+def _travel_polyline_lead_exit_xy(var: np.ndarray, lead_straight_mm: float) -> np.ndarray:
+    """Lead-out end ``E = p_end + L dir_out`` after the flush straight from the cut (exporter convention)."""
+    p = np.asarray(var, dtype=float)
+    if len(p) < 2:
+        return np.asarray(p[-1], dtype=float).reshape(2).copy()
+    L = float(lead_straight_mm)
+    dir_out = _unit2d(p[-1] - p[-2])
+    return (p[-1] + L * dir_out).reshape(2).copy()
+
+
+def _greedy_transition_arc_penalty_mm(
+    E,
+    dir_out,
+    B,
+    dir_in,
+    *,
+    theta_min_rad: float,
+    unified_fail_penalty_mm: float,
+    sharp_turn_penalty_mm_per_rad: float,
+) -> float:
+    """
+    Extra greedy cost (mm-equivalent) for inter-contour motion quality vs ``_try_append_unified_inter_contour_transition``.
+
+    Penalizes (a) intersection ``t_hit < 0`` where unified fails and legacy stacked arcs often appear,
+    and (b) large path deflection ψ above ``theta_min_rad`` where a **non-cutting** arc replaces straight.
+    """
+    E = np.asarray(E, dtype=float).reshape(2)
+    B = np.asarray(B, dtype=float).reshape(2)
+    dir_u = _unit2d(dir_out)
+    dn_u = _unit2d(dir_in)
+    cross = _cross2d(dir_u, dn_u)
+    if abs(cross) < 1e-12:
+        return 0.0
+
+    diff = B - E
+    t_hit = float(_cross2d(diff, dn_u) / cross)
+    if t_hit < -1e-5:
+        return max(0.0, float(unified_fail_penalty_mm))
+
+    V = E + t_hit * dir_u
+    lv = float(np.linalg.norm(V - E))
+    lb = float(np.linalg.norm(V - B))
+    if lv < 1e-9 or lb < 1e-9:
+        return 0.0
+
+    u_ve = _unit2d(E - V)
+    u_vb = _unit2d(B - V)
+    cos_psi = float(np.clip(np.dot(-u_ve, u_vb), -1.0, 1.0))
+    psi = float(math.acos(cos_psi))
+    if psi < float(theta_min_rad):
+        return 0.0
+
+    excess = psi - float(theta_min_rad)
+    return max(0.0, float(sharp_turn_penalty_mm_per_rad)) * excess
+
+
 def optimize_contour_chunks_travel_greedy(
     contour_chunks,
     contour_closed,
