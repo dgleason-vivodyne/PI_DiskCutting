@@ -2,6 +2,7 @@ import csv
 import json
 import math
 import os
+from collections import deque
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -338,6 +339,111 @@ def _orient_segment_to_follow_chain(raw: np.ndarray, prev_tail: np.ndarray) -> n
     return r.copy()
 
 
+def _order_segments_into_chains(
+    segments: list,
+    gap_threshold: float,
+) -> list[list[tuple]]:
+    """
+    Group interpolated DXF primitives into contours and order each contour head-to-tail.
+
+    Parameters
+    ----------
+    segments
+        ``(entity, raw_xy)`` items with ``raw_xy`` ``(N, 2)`` from ``interpolate_entity_xy``,
+        in arbitrary order (typically modelspace iteration order).
+    gap_threshold
+        Max endpoint distance (mm) for treating two segments as adjacent.
+
+    Returns
+    -------
+    List of contours; each contour is ``[(entity, oriented_raw_ndarray), ...]`` in traversal order.
+    """
+    n = len(segments)
+    if n == 0:
+        return []
+
+    unused = set(range(n))
+    chains_out: list[list[tuple]] = []
+
+    def best_attach_to_tail(tail: np.ndarray) -> tuple[int | None, np.ndarray | None, float]:
+        best_j: int | None = None
+        best_raw: np.ndarray | None = None
+        best_d = float("inf")
+        for j in unused:
+            raw = np.asarray(segments[j][1], dtype=float)
+            if len(raw) == 0:
+                continue
+            if len(raw) == 1:
+                d = float(np.linalg.norm(raw[0] - tail))
+                if d < best_d:
+                    best_d, best_j, best_raw = d, j, raw.copy()
+                continue
+            d_fwd = float(np.linalg.norm(raw[0] - tail))
+            d_rev = float(np.linalg.norm(raw[-1] - tail))
+            if d_rev < d_fwd - 1e-9:
+                cand_d, cand_raw = d_rev, np.flipud(raw).copy()
+            else:
+                cand_d, cand_raw = d_fwd, raw.copy()
+            if cand_d < best_d:
+                best_d, best_j, best_raw = cand_d, j, cand_raw
+        if best_j is None:
+            return None, None, float("inf")
+        return best_j, best_raw, best_d
+
+    def best_attach_to_head(head: np.ndarray) -> tuple[int | None, np.ndarray | None, float]:
+        """Pick a segment to prepend so its **last** vertex meets ``head``."""
+        best_j: int | None = None
+        best_raw: np.ndarray | None = None
+        best_d = float("inf")
+        for j in unused:
+            raw = np.asarray(segments[j][1], dtype=float)
+            if len(raw) == 0:
+                continue
+            if len(raw) == 1:
+                d = float(np.linalg.norm(raw[0] - head))
+                if d < best_d:
+                    best_d, best_j, best_raw = d, j, raw.copy()
+                continue
+            d_fwd = float(np.linalg.norm(raw[-1] - head))
+            d_rev = float(np.linalg.norm(raw[0] - head))
+            if d_rev < d_fwd - 1e-9:
+                cand_d, cand_raw = d_rev, np.flipud(raw).copy()
+            else:
+                cand_d, cand_raw = d_fwd, raw.copy()
+            if cand_d < best_d:
+                best_d, best_j, best_raw = cand_d, j, cand_raw
+        if best_j is None:
+            return None, None, float("inf")
+        return best_j, best_raw, best_d
+
+    while unused:
+        seed = min(unused)
+        unused.remove(seed)
+        ent0, raw0 = segments[seed]
+        chain_dq: deque[tuple] = deque()
+        chain_dq.append((ent0, np.asarray(raw0, dtype=float).copy()))
+
+        while True:
+            tail = chain_dq[-1][1][-1]
+            j, oriented, d = best_attach_to_tail(tail)
+            if j is None or d > gap_threshold:
+                break
+            unused.remove(j)
+            chain_dq.append((segments[j][0], oriented))
+
+        while True:
+            head = chain_dq[0][1][0]
+            j, oriented, d = best_attach_to_head(head)
+            if j is None or d > gap_threshold:
+                break
+            unused.remove(j)
+            chain_dq.appendleft((segments[j][0], oriented))
+
+        chains_out.append(list(chain_dq))
+
+    return chains_out
+
+
 def generate_contours_from_dxf(
     dxf_path: str,
     spacing: float,
@@ -345,9 +451,11 @@ def generate_contours_from_dxf(
     min_stitch_gap_mm: float = 1.0,
 ):
     """
-    Entity-order chains: merge LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE on allowed layers until gap > threshold.
-    Each new entity is oriented (forward vs reversed) so its start matches the previous tail when
-    possible. Returns a list of dicts: {"points": (N,2) float array}.
+    Head-to-tail chains: collect LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE on allowed
+    layers into contiguous modelspace **runs** (turned-off layers still split runs, except
+    Startpoints markers). Within each run, **sort primitives by endpoint proximity** (within gap
+    threshold), orient each segment along the cut, then merge polylines. Returns a list of dicts:
+    ``{"points": (N,2) float array}``.
 
     ``min_stitch_gap_mm`` (default 1 mm): CAD endpoints often sit ~0.5–0.7 mm apart on corners; a
     threshold of only ``gap_multiplier * spacing`` would split outlines and leave long chord hops
@@ -360,61 +468,70 @@ def generate_contours_from_dxf(
     gap_threshold = max(float(gap_multiplier) * float(spacing), float(min_stitch_gap_mm))
     stitch_eps = max(float(spacing) * 0.25, 1e-9)
 
-    chains = []
-    current = None
-    chain_entities = []
-
+    segment_runs: list[list[tuple]] = []
+    current_run: list[tuple] = []
     for entity in msp:
         dt = entity.dxftype()
         if dt not in ("LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE", "LWPOLYLINE", "POLYLINE"):
             continue
         if not _entity_layer_processed(doc, entity):
-            # Startpoints (seam markers) are not cut geometry; skipping them must NOT break the
-            # current chain — otherwise a marker circle between bean segments splits one outline
-            # into multiple contours and the flat path shows sub-mm "teleports" at vstack joins.
+            # Same split semantics as legacy entity-order pass: layer-off (except Startpoints)
+            # ends the current run so hidden sandwiched geometry cannot stitch separate cuts.
             if _is_startpoints_layer_name(entity):
                 continue
-            if current is not None and len(current) > 0:
-                chains.append((current, chain_entities))
-                current = None
-                chain_entities = []
+            if current_run:
+                segment_runs.append(current_run)
+                current_run = []
             continue
         raw = interpolate_entity_xy(entity, spacing)
         if raw is None or len(raw) == 0:
             continue
+        current_run.append((entity, raw))
+    if current_run:
+        segment_runs.append(current_run)
 
-        if current is None:
-            current = np.asarray(raw, dtype=float).copy()
-            chain_entities = [entity]
-            continue
+    ordered_chains: list[list[tuple]] = []
+    for run in segment_runs:
+        ordered_chains.extend(_order_segments_into_chains(run, gap_threshold))
 
-        prev_tail = current[-1]
-        seg = _orient_segment_to_follow_chain(raw, prev_tail)
-        d_joint = float(np.linalg.norm(seg[0] - prev_tail))
+    chains = []
+    for ordered in ordered_chains:
+        current = None
+        chain_entities = []
+        for entity, raw in ordered:
+            raw = np.asarray(raw, dtype=float)
+            if current is None:
+                current = raw.copy()
+                chain_entities = [entity]
+                continue
 
-        if d_joint > gap_threshold:
-            chains.append((current, chain_entities))
-            current = np.asarray(raw, dtype=float).copy()
-            chain_entities = [entity]
-            continue
+            prev_tail = current[-1]
+            seg = raw.copy()
+            d_joint = float(np.linalg.norm(seg[0] - prev_tail))
 
-        if d_joint < stitch_eps:
-            add = seg[1:] if len(seg) > 1 else np.empty((0, 2))
-        else:
-            chord = _chord_dense_samples(prev_tail, seg[0], spacing)
-            if len(chord) > 0 and len(seg) > 1:
-                add = np.vstack([chord, seg[1:]])
-            elif len(chord) > 0:
-                add = chord
+            if d_joint > gap_threshold:
+                chains.append((current, chain_entities))
+                current = seg.copy()
+                chain_entities = [entity]
+                continue
+
+            if d_joint < stitch_eps:
+                add = seg[1:] if len(seg) > 1 else np.empty((0, 2))
             else:
-                add = seg
+                chord = _chord_dense_samples(prev_tail, seg[0], spacing)
+                if len(chord) > 0 and len(seg) > 1:
+                    add = np.vstack([chord, seg[1:]])
+                elif len(chord) > 0:
+                    add = chord
+                else:
+                    add = seg
 
-        if len(add) > 0:
-            current = np.vstack([current, add])
-        chain_entities.append(entity)
+            if len(add) > 0:
+                current = np.vstack([current, add])
+            chain_entities.append(entity)
 
-    if current is not None and len(current) > 0:
-        chains.append((current, chain_entities))
+        if current is not None and len(current) > 0:
+            chains.append((current, chain_entities))
 
     contours = []
     for pts, ents in chains:
@@ -450,11 +567,11 @@ def generate_contours_from_dxf(
 
 def generate_points_from_dxf(dxf_file, spacing):
     """
-    Extract points from DXF: entity-order contours on allowed layers.
+    Extract points from DXF: contours on allowed layers with primitives ordered head-to-tail.
 
-    Vertex order along each contour follows stitched LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE samples; when
-    chaining entities, each segment is **reversed if needed** so its start matches the previous
-    tail (CAD file order is not always head-to-tail). Do **not** run ``optimize_path`` on those points:
+    Vertex order along each contour follows stitched LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE samples;
+    primitives are grouped and oriented by **endpoint proximity** before stitching (DXF draw order may differ).
+    Do **not** run ``optimize_path`` on those points:
     angle-sort + nearest-neighbor reorders dense samples on a closed curve and produces long
     chords that zigzag across the interior (looks like non-sequential hops in a preview).
 
