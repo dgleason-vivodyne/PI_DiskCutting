@@ -1217,6 +1217,115 @@ def _solve_lead_out_arc_after_decel_straight(
     return C, float(R_use), T2
 
 
+def _try_append_unified_inter_contour_transition(
+    segs,
+    E,
+    dir_out,
+    p_next,
+    dn,
+    L,
+    R_cap_mm: float,
+    theta_min_rad: float,
+    spacing: float,
+):
+    """
+    One tangent-preserving corner from lead-out end ``E`` along ``dir_out`` to the next contour's
+    collinear approach point ``B = p_next - L * dn``. Uses the intersection of the two infinite lines
+    (exit ray and approach ray) as the fillet vertex — tangent points slide along those lines instead
+    of stacking a separate lead-out arc + travel arc.
+
+    Appends: optional ``E→T1``, arc ``T1→T2``, optional ``T2→B``. Returns ``(True, B)`` if the
+    motion was emitted (straight-only counts), else ``(False, None)`` so callers can fall back to the
+    legacy lead-out arc + travel fillet chain.
+    """
+    E = np.asarray(E, dtype=float).reshape(2)
+    p_next = np.asarray(p_next, dtype=float).reshape(2)
+    dir_u = _unit2d(dir_out)
+    dn_u = _unit2d(dn)
+    B = p_next - float(L) * dn_u
+
+    cross = _cross2d(dir_u, dn_u)
+    if abs(cross) < 1e-12:
+        _append_straight_segment_single(segs, E, B)
+        return True, B.copy()
+
+    diff = B - E
+    t_hit = float(_cross2d(diff, dn_u) / cross)
+    V = E + t_hit * dir_u
+
+    if t_hit < -1e-5:
+        return False, None
+
+    lv = float(np.linalg.norm(V - E))
+    lb = float(np.linalg.norm(V - B))
+    if lv < 1e-9 or lb < 1e-9:
+        _append_straight_segment_single(segs, E, B)
+        return True, B.copy()
+
+    # ``u_ve`` points V→E; motion toward the corner runs E→V (−u_ve). ``u_vb`` points V→B (departure).
+    # Fillet turn angle is the **path deflection** ψ between −u_ve and u_vb, not the acute angle between u_ve and u_vb.
+    u_ve = _unit2d(E - V)
+    u_vb = _unit2d(B - V)
+    cos_psi = float(np.clip(np.dot(-u_ve, u_vb), -1.0, 1.0))
+    psi = float(math.acos(cos_psi))
+
+    def _straight_fallback():
+        _append_straight_segment_single(segs, E, B)
+        return True, B.copy()
+
+    if psi < float(theta_min_rad):
+        return _straight_fallback()
+
+    tan_h = math.tan(0.5 * psi)
+    if tan_h < 1e-12:
+        return _straight_fallback()
+
+    R_cap = max(float(R_cap_mm), 0.0)
+    if R_cap <= 1e-12:
+        return _straight_fallback()
+
+    R_geom = min(lv, lb) / tan_h
+    R_use = min(R_cap, R_geom)
+    if R_use <= 1e-12:
+        return _straight_fallback()
+
+    d = R_use * tan_h
+    if d > lv + 1e-6 or d > lb + 1e-6:
+        return _straight_fallback()
+
+    T1 = V + d * u_ve
+    T2 = V + d * u_vb
+
+    chord_et = np.asarray(T1, dtype=float).reshape(2) - E.reshape(2)
+    tan_in = _unit2d(chord_et) if float(np.linalg.norm(chord_et)) > 1e-9 else (-u_ve).copy()
+    p_left = np.array([-tan_in[1], tan_in[0]], dtype=float)
+    n1 = _unit2d(p_left)
+    n2 = -n1
+    best_C = None
+    best_err = float("inf")
+    for nrm in (n1, n2):
+        Cc = np.asarray(T1, dtype=float).reshape(2) + float(R_use) * nrm
+        err = max(
+            abs(float(np.linalg.norm(T1 - Cc)) - R_use),
+            abs(float(np.linalg.norm(T2 - Cc)) - R_use),
+        )
+        if err < best_err:
+            best_err = err
+            best_C = Cc
+    if best_C is None or best_err > 0.08:
+        return _straight_fallback()
+    C = best_C
+
+    if float(np.linalg.norm(chord_et)) > 1e-9:
+        _append_straight_segment_single(segs, E, T1)
+    tan_a = chord_et if float(np.linalg.norm(chord_et)) > 1e-9 else dir_u
+    _append_arc_segments_densified(segs, C, R_use, T1, T2, spacing, tangent_from_a=tan_a)
+    if float(np.linalg.norm(B.reshape(2) - np.asarray(T2, dtype=float).reshape(2))) > 1e-9:
+        _append_straight_segment_single(segs, T2, B)
+
+    return True, B.copy()
+
+
 def build_export_segments_with_leads(
     full,
     starts,
