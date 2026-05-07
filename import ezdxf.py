@@ -1337,6 +1337,9 @@ def build_export_segments_with_leads(
     cad_origin_xy=(0.0, 0.0),
     travel_fillet_radius_mm: float = 0.35,
     travel_fillet_min_turn_deg: float = 25.0,
+    travel_fillet_chord_extra_mm: float = 0.0,
+    travel_fillet_chord_fraction: float = 1.0,
+    travel_fillet_lead_out_arc_length_max_mm: float | None = None,
 ):
     """
     Build ordered motion segments: per contour (lead-in -> cut polyline with overlap ->
@@ -1344,17 +1347,22 @@ def build_export_segments_with_leads(
 
     Lead-in/out keep a straight collinear segment of length ``L = v_max^2/(2 a_tan)`` immediately
     before/after the cut: **lead-in** is (approach fillet if any) then **L** flush to the cut start;
-    **lead-out** is **L** flush from the cut end then an optional arc into travel (mirror order).
-    The arc is tangent to ``dir_out`` at ``E = p_end + L dir_out`` so deceleration uses the full ``L``
-    along cut tangent before any lateral accel. The **last** contour uses a **virtual** next lead-in
-    at ``p_start`` / ``dir_in`` for the travel-heading probe only. Non-cutting corners
-    (CAD origin approach, lead-out→chord toward the next or virtual lead-in, travel at the next
-    lead-in) may use a **small fixed-radius**
+    **lead-out** is **L** flush from the cut end to ``E = p_end + L dir_out``. When another contour
+    follows, an optional arc at ``E`` blends into inter-contour travel; the **final** contour omits
+    that arc (straight lead-out only — no extra motion after ``E``). Non-cutting corners
+    (CAD origin approach, lead-out→travel when applicable, travel at the next lead-in) may use a
+    **small fixed-radius**
     circular fillet when the **path deflection** at that vertex is at least
     ``travel_fillet_min_turn_deg``; otherwise motion stays straight (allows modest accel jumps).
-    Lead-out blend uses the same radius cap with chord budget along the travel probe; lead-in corner
-    solver still uses ``d = R * tan(beta/2)`` tangent offsets at the virtual approach corner.
-    ``spacing`` subdivides **fillet arc** motion only; other non-cutting chords are single segments.
+    **Variable-radius fillets:** ``travel_fillet_radius_mm`` is only a **maximum**; actual
+    ``R_use`` is ``min(R_cap, R_geometry)`` from local chord/tangent budgets (lead-in/travel corners
+    use the iterative corner solver; lead-out→travel arc uses the budget along the travel probe when
+    a next contour exists). Optional ``travel_fillet_chord_fraction`` /
+    ``travel_fillet_chord_extra_mm`` adjust that probe budget for the **lead-out→travel** arc only;
+    ``travel_fillet_lead_out_arc_length_max_mm`` caps that arc length
+    ``R * beta``. Lead-in corner solver still uses ``d = R * tan(beta/2)`` tangent offsets at the
+    virtual approach corner. ``spacing`` subdivides **fillet arc** motion only; other non-cutting
+    chords are single segments.
 
     Returns ``(segs, replay, schedule)`` where ``segs`` is a list of (p0, p1), ``replay`` maps
     destination segment index -> source index for overlap retrace, and ``schedule`` is a list of
@@ -1491,17 +1499,24 @@ def generate_csv_from_points(
     spacing: float = 0.01,
     travel_fillet_radius_mm: float = 0.35,
     travel_fillet_min_turn_deg: float = 25.0,
+    travel_fillet_chord_extra_mm: float = 0.0,
+    travel_fillet_chord_fraction: float = 1.0,
+    travel_fillet_lead_out_arc_length_max_mm: float | None = None,
     rapid_max_velocity_mm_s=None,
 ):
     """
     Writes the main PVT CSV with laser I/O only around **cut** motion (not during lead-in/out or
     travel). Lead-in/out keep a straight collinear segment of length ``v_max^2 / (2 a_tan)`` mm
-    flush against the cut (approach fillet before lead-in ``L``, exit ``L`` then travel fillet).
-    Non-cutting corners use an optional **fixed-radius**
-    symmetric fillet when the **path deflection** is at least ``travel_fillet_min_turn_deg``;
-    ``travel_fillet_radius_mm`` is clamped by local chord geometry. Shallower corners stay straight.
-    Cut polylines follow DXF sampling; non-cutting **arc** blends (lead-in, lead-out→travel including
-    on the final contour using a virtual lead-in at cut start, travel at the next lead-in) use ``spacing``
+    flush against the cut (approach fillet before lead-in ``L``, exit ``L`` then, if another contour
+    follows, optional arc into travel — omitted on the final contour).
+    Non-cutting corners use an optional variable-radius circular fillet when the **path deflection**
+    is at least ``travel_fillet_min_turn_deg``;
+    ``travel_fillet_radius_mm`` is a **maximum**; realized radius is ``min(cap, geometry)``. Optional
+    ``travel_fillet_chord_fraction`` / ``travel_fillet_chord_extra_mm`` adjust lead-out→travel arc
+    chord budget when applicable; ``travel_fillet_lead_out_arc_length_max_mm`` caps that arc. Shallower corners
+    stay straight.
+    Cut polylines follow DXF sampling; non-cutting **arc** blends (lead-in, lead-out→travel when there
+    is a next contour, travel at the next lead-in) use ``spacing``
     along the arc; remaining non-cutting straights are single
     segments. Inter-contour motion is travel (laser off).
     ``0,0,0,0,0`` sync starts the file; relative file ends with laser-off rows.
@@ -1588,6 +1603,9 @@ def generate_csv_from_points(
         cad_origin_xy=cad_o,
         travel_fillet_radius_mm=travel_fillet_radius_mm,
         travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
+        travel_fillet_chord_extra_mm=travel_fillet_chord_extra_mm,
+        travel_fillet_chord_fraction=travel_fillet_chord_fraction,
+        travel_fillet_lead_out_arc_length_max_mm=travel_fillet_lead_out_arc_length_max_mm,
     )
     if not segs:
         raise ValueError("No export segments (empty path).")
