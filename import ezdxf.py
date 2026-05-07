@@ -2083,11 +2083,14 @@ if __name__ == '__main__':
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
     optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(dxf_file, spacing)
     if prompt_optimize_contour_travel() and len(contour_chunks) > 0:
+        _L_air = _lead_length_mm(max_velocity, max_acceleration)
         contour_chunks = optimize_contour_chunks_travel_greedy(
             contour_chunks,
             contour_closed,
             spacing_mm=spacing,
             origin_xy=(0.0, 0.0),
+            lead_straight_mm=_L_air,
+            travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
         )
 
     overlap_count = prompt_overlap_point_count()
