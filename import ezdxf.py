@@ -1084,18 +1084,27 @@ def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing):
         prev = p1_
 
 
-def _solve_lead_out_to_travel_fillet_at_E(
-    E, dir_out, L, u_travel_from_E, lc_travel_chord, R_fixed_mm, theta_min_rad
+def _cross2d(a, b) -> float:
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    return ax * by - ay * bx
+
+
+def _solve_lead_out_arc_after_decel_straight(
+    E,
+    dir_out,
+    u_travel_from_E,
+    lc_travel_chord,
+    R_fixed_mm,
+    theta_min_rad,
 ):
     """
-    Symmetric fillet at lead-out end ``E`` between incoming ray ``dir_out`` (into ``E``) and the
-    **first inter-contour travel chord** direction ``u_travel_from_E`` (unit vector from ``E`` toward
-    the virtual corner used by ``_solve_travel_corner_fillet_fixed_radius`` for the next lead-in).
+    After a **full** collinear deceleration ending at ``E`` along ``dir_out``, round the corner into
+    travel direction ``w`` with a circular arc that **starts at E** tangent to ``dir_out`` (C¹ with
+    the decel straight — same mirror as lead-in, where the L-length straight sits flush against the
+    cut). Uses chord budget ``lc_travel_chord`` along ``w`` from ``E``.
 
-    Same gating and radius cap as other travel fillets: ``beta = angle(dir_out, u_travel_from_E)`` vs
-    ``theta_min_rad``, ``R_geom = min(L, lc_travel_chord) / tan(beta/2)``.
-
-    Returns ``(T1, T2, R_use, th_arc)`` or ``None`` if skipped.
+    Returns ``(C_center, R_use, T2)`` or ``None`` if skipped (shallow turn or degenerate geometry).
     """
     R_cap = max(float(R_fixed_mm), 0.0)
     if R_cap <= 1e-12:
@@ -1105,28 +1114,31 @@ def _solve_lead_out_to_travel_fillet_at_E(
     if lc_out <= 1e-9:
         return None
     w = _unit2d(u_travel_from_E)
-    u_in = _unit2d(dir_out)
-    cos_beta = float(np.clip(np.dot(u_in, w), -1.0, 1.0))
+    u0 = _unit2d(dir_out)
+    cos_beta = float(np.clip(np.dot(u0, w), -1.0, 1.0))
     beta = float(math.acos(cos_beta))
     if beta < float(theta_min_rad):
         return None
-    th2 = 0.5 * beta
-    tan_h = max(math.tan(th2), 1e-12)
-    Lf = float(L)
-    if Lf <= 1e-12:
+    cr = _cross2d(u0, w)
+    if abs(cr) < 1e-14 and abs(beta) > 1e-6:
         return None
-    R_geom = min(Lf, lc_out) / tan_h
+    sgn = 1.0 if cr >= 0.0 else -1.0
+    n = sgn * np.array([-u0[1], u0[0]], dtype=float)
+    wdn = float(np.dot(w, n))
+    if wdn <= 1e-12:
+        return None
+    R_geom = lc_out / (2.0 * wdn)
     R_use = min(R_cap, R_geom)
     if R_use <= 1e-12:
         return None
-    d = R_use * tan_h
-    if d > Lf + 1e-6 or d > lc_out + 1e-6:
+    t_ray = 2.0 * R_use * wdn
+    if t_ray > lc_out + 1e-5:
         return None
-    T1 = E - d * u_in
-    T2 = E + d * w
-    cos_delta = float(np.clip(np.dot(-u_in, w), -1.0, 1.0))
-    th_arc = float(math.acos(cos_delta))
-    return T1, T2, R_use, th_arc
+    C = E + R_use * n
+    T2 = E + t_ray * w
+    if not _travel_fillet_arc_points_on_circle(C, R_use, E, T2):
+        return None
+    return C, float(R_use), T2
 
 
 def build_export_segments_with_leads(
@@ -1146,15 +1158,18 @@ def build_export_segments_with_leads(
     lead-out), then travel to the next contour's lead-in start.
 
     Lead-in/out keep a straight collinear segment of length ``L = v_max^2/(2 a_tan)`` immediately
-    before/after the cut (the lead-out straight may stop short of nominal ``E`` when a
-    lead-out→travel fillet is emitted). Non-cutting corners (CAD origin approach, lead-out→chord
-    toward the next contour, travel at the next lead-in) may use a **small fixed-radius** symmetric
+    before/after the cut: **lead-in** is (approach fillet if any) then **L** flush to the cut start;
+    **lead-out** is **L** flush from the cut end then an optional arc into travel (mirror order).
+    The arc is tangent to ``dir_out`` at ``E = p_end + L dir_out`` so deceleration uses the full ``L``
+    along cut tangent before any lateral accel. The **last** contour uses a **virtual** next lead-in
+    at ``p_start`` / ``dir_in`` for the travel-heading probe only. Non-cutting corners
+    (CAD origin approach, lead-out→chord toward the next or virtual lead-in, travel at the next
+    lead-in) may use a **small fixed-radius**
     circular fillet when the **path deflection** at that vertex is at least
     ``travel_fillet_min_turn_deg``; otherwise motion stays straight (allows modest accel jumps).
-    Fillet radius is ``min(travel_fillet_radius_mm, R_geom)`` with ``R_geom = lc / tan(beta/2)``
-    and tangent offset ``d = R * tan(beta/2)`` (``beta`` = path deflection, ``lc`` = local chord
-    budget on the relevant leg). ``spacing`` subdivides **fillet arc** motion only; other non-cutting
-    chords are single segments.
+    Lead-out blend uses the same radius cap with chord budget along the travel probe; lead-in corner
+    solver still uses ``d = R * tan(beta/2)`` tangent offsets at the virtual approach corner.
+    ``spacing`` subdivides **fillet arc** motion only; other non-cutting chords are single segments.
 
     Returns ``(segs, replay, schedule)`` where ``segs`` is a list of (p0, p1), ``replay`` maps
     destination segment index -> source index for overlap retrace, and ``schedule`` is a list of
@@ -1228,37 +1243,36 @@ def build_export_segments_with_leads(
             else:
                 dn = np.array([1.0, 0.0], dtype=float)
             p_next = W_next[0]
-            _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
-                p_next,
-                dn,
-                L,
-                E,
-                travel_fillet_radius_mm,
-                theta_min_rad,
-            )
-            lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
-            lo_e_f = _solve_lead_out_to_travel_fillet_at_E(
-                E,
-                dir_out,
-                L,
-                u_tr0,
-                lc_travel,
-                travel_fillet_radius_mm,
-                theta_min_rad,
-            )
-            if lo_e_f is not None:
-                T1_e, T2_e, R_e, th_e = lo_e_f
-                _append_straight_segment_single(segs, p_end, T1_e)
-                C_e = _fillet_arc_center_from_corner(E, dir_out, u_tr0, R_e, th_e)
-                if C_e is None or not _travel_fillet_arc_points_on_circle(C_e, R_e, T1_e, T2_e):
-                    _append_straight_segment_single(segs, T1_e, T2_e)
-                else:
-                    _append_arc_segments_densified(segs, C_e, R_e, T1_e, T2_e, spacing)
-                travel_from = T2_e
-            else:
-                _append_straight_segment_single(segs, p_end, E)
         else:
-            _append_straight_segment_single(segs, p_end, E)
+            # Virtual next lead-in at this contour's entry (same p_start / dir_in) so the final
+            # lead-out still gets a travel-style fillet when there is no following contour.
+            p_next = np.asarray(p_start, dtype=float).reshape(2).copy()
+            dn = dir_in.copy()
+
+        _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
+            p_next,
+            dn,
+            L,
+            E,
+            travel_fillet_radius_mm,
+            theta_min_rad,
+        )
+        lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
+        _append_straight_segment_single(segs, p_end, E)
+        lo_arc = _solve_lead_out_arc_after_decel_straight(
+            E,
+            dir_out,
+            u_tr0,
+            lc_travel,
+            travel_fillet_radius_mm,
+            theta_min_rad,
+        )
+        if lo_arc is not None:
+            C_e, R_e, T2_e = lo_arc
+            _append_arc_segments_densified(segs, C_e, R_e, E, T2_e, spacing)
+            travel_from = T2_e
+        else:
+            travel_from = E
 
         lo_hi = len(segs)
         schedule.append(("lead_out", lo_lo, lo_hi))
