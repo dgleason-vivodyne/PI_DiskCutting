@@ -1153,12 +1153,27 @@ def _solve_lead_out_arc_after_decel_straight(
     lc_travel_chord,
     R_fixed_mm,
     theta_min_rad,
+    *,
+    chord_extra_mm: float = 0.0,
+    chord_fraction: float = 1.0,
+    arc_length_max_mm: float | None = None,
 ):
     """
     After a **full** collinear deceleration ending at ``E`` along ``dir_out``, round the corner into
-    travel direction ``w`` with a circular arc that **starts at E** tangent to ``dir_out`` (C¹ with
-    the decel straight — same mirror as lead-in, where the L-length straight sits flush against the
-    cut). Uses chord budget ``lc_travel_chord`` along ``w`` from ``E``.
+    inter-contour travel direction ``w`` with a circular arc that **starts at E** tangent to
+    ``dir_out``. Called only when another contour follows; the **final** contour stops at ``E`` with
+    no arc.
+
+    **Variable radius:** for turn angle ``beta`` between ``dir_out`` and ``w``, a feasible radius
+    must satisfy ``t = 2 R (w·n) <= lc`` where ``lc`` is the travel chord budget along ``w`` and
+    ``n`` is the inward normal used below — equivalently ``R <= lc / (2 (w·n))``. We use
+    ``R_use = min(R_cap, R_geom)`` with ``R_cap = travel_fillet_radius_mm`` and
+    ``R_geom = lc / (2 (w·n))``, i.e. **the largest circle that fits** inside the cap and chord
+    budget (farthest tangent on the travel ray). Optional ``arc_length_max_mm`` shrinks ``R`` so
+    arc length ``R * beta`` does not exceed that cap.
+
+    ``chord_fraction`` / ``chord_extra_mm`` scale or inflate ``lc`` derived from the travel probe
+    (lets you shrink or extend how far along ``w`` the tangent may sit).
 
     Returns ``(C_center, R_use, T2)`` or ``None`` if skipped (shallow turn or degenerate geometry).
     """
@@ -1166,7 +1181,10 @@ def _solve_lead_out_arc_after_decel_straight(
     if R_cap <= 1e-12:
         return None
     E = np.asarray(E, dtype=float).reshape(2)
-    lc_out = float(lc_travel_chord)
+    lc0 = float(lc_travel_chord)
+    fr = max(float(chord_fraction), 0.0)
+    ex = max(float(chord_extra_mm), 0.0)
+    lc_out = lc0 * fr + ex
     if lc_out <= 1e-9:
         return None
     w = _unit2d(u_travel_from_E)
@@ -1185,6 +1203,8 @@ def _solve_lead_out_arc_after_decel_straight(
         return None
     R_geom = lc_out / (2.0 * wdn)
     R_use = min(R_cap, R_geom)
+    if arc_length_max_mm is not None and beta > 1e-12:
+        R_use = min(R_use, max(float(arc_length_max_mm), 0.0) / beta)
     if R_use <= 1e-12:
         return None
     t_ray = 2.0 * R_use * wdn
