@@ -1516,7 +1516,9 @@ def build_export_segments_with_leads(
         li_lo = len(segs)
         B_exp = p_start - L * dir_in
         anchor_snap_tol = max(0.05, float(spacing) * 10.0)
-        if float(np.linalg.norm(next_lead_anchor - B_exp)) <= anchor_snap_tol:
+        # First contour: entry anchor may be unknown at runtime, so do not synthesize an
+        # initial approach arc. Start with a straight lead-in into the cut instead.
+        if k == 0 or float(np.linalg.norm(next_lead_anchor - B_exp)) <= anchor_snap_tol:
             _append_straight_segment_single(segs, next_lead_anchor, p_start)
         else:
             _P, d_li, R_li, u_li, th_li, T1_li, T2_li = _solve_travel_corner_fillet_fixed_radius(
