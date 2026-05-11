@@ -2273,15 +2273,22 @@ if __name__ == '__main__':
     print(f"Using DXF: {dxf_file}")
 
     spacing = 0.01  # Spacing between points (in mm)
-    max_velocity = 100  # Max velocity (in mm/sec)
+    max_velocity = 100  # Max velocity (in mm/sec) — CSV cut timing cap
     max_acceleration = 5000  # Max tangential acceleration (in mm/s^2)
+    # Collinear lead length L = v^2/(2a). Use None to derive L from max_velocity only.
+    lead_straight_velocity_mm_s = 100.0
     travel_fillet_radius_mm = 0.35  # Non-cutting corner blend radius (mm); clamped by geometry
     travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
     optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(dxf_file, spacing)
     if prompt_optimize_contour_travel() and len(contour_chunks) > 0:
-        _L_air = _lead_length_mm(max_velocity, max_acceleration)
+        _v_lead_geom = (
+            float(lead_straight_velocity_mm_s)
+            if lead_straight_velocity_mm_s is not None
+            else float(max_velocity)
+        )
+        _L_air = _lead_length_mm(_v_lead_geom, max_acceleration)
         contour_chunks = optimize_contour_chunks_travel_greedy(
             contour_chunks,
             contour_closed,
@@ -2309,6 +2316,7 @@ if __name__ == '__main__':
         spacing=spacing,
         travel_fillet_radius_mm=travel_fillet_radius_mm,
         travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
+        lead_straight_velocity_mm_s=lead_straight_velocity_mm_s,
     )
 
     plot_points_with_velocity_vectors(
