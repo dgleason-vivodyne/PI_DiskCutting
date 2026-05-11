@@ -1006,6 +1006,163 @@ def _segment_time_velocity(p0, p1, max_velocity, max_acceleration):
     return dt, float((p1[0] - p0[0]) / dt), float((p1[1] - p0[1]) / dt)
 
 
+def _max_scalar_speed_for_chord_mm_s(dist, v_cap, max_acceleration):
+    """
+    Largest constant speed magnitude ``dist/dt_min`` achievable along a straight chord of length
+    ``dist`` under ``calculate_time_to_move`` (triangle/trapezoid with ``v_cap`` and tangential
+    ``max_acceleration``).
+    """
+    d = float(dist)
+    if d <= 1e-15:
+        return 0.0
+    dt = calculate_time_to_move(d, float(v_cap), float(max_acceleration))
+    if dt <= 1e-15:
+        return 0.0
+    return d / dt
+
+
+def _apply_non_cut_joint_velocity_matching(rel_rows, segs, schedule, rapid_v, max_acceleration):
+    """
+    For each maximal contiguous run of **non-cut** segments (lead-in, lead-out, travel), rescale
+    times so every segment in the run uses the **same** scalar speed ``s`` (``|v|``).
+
+    Exact **vector** velocity matching between consecutive straight chords is impossible when the
+    heading changes; matching ``|v|`` removes speed discontinuities at joints while keeping motion
+    along each chord at constant ``(vx, vy)``. Each segment remains feasible because
+    ``s <= min_j (max speed allowed for chord j alone)``, hence ``dt_j = L_j / s`` is at least the
+    minimum-time chord duration.
+
+    Cut segments are untouched.
+    """
+    n = len(segs)
+    j = 0
+    while j < n:
+        if _schedule_kind_at_segment_index(schedule, j) == "cut":
+            j += 1
+            continue
+        lo = j
+        while j < n and _schedule_kind_at_segment_index(schedule, j) != "cut":
+            j += 1
+        hi = j
+        if hi <= lo:
+            continue
+
+        caps = []
+        geom = []
+        for k in range(lo, hi):
+            p0, p1 = segs[k]
+            dx = float(p1[0] - p0[0])
+            dy = float(p1[1] - p0[1])
+            dist = float(math.hypot(dx, dy))
+            geom.append((dx, dy, dist))
+            caps.append(_max_scalar_speed_for_chord_mm_s(dist, rapid_v, max_acceleration))
+
+        finite_caps = [c for c in caps if c > 1e-15 and math.isfinite(c)]
+        if not finite_caps:
+            continue
+        s = min(finite_caps)
+        if s <= 1e-15:
+            continue
+
+        for t, k in enumerate(range(lo, hi)):
+            dx, dy, dist = geom[t]
+            if dist <= 1e-15:
+                rel_rows[k] = (0.0, dx, 0.0, dy, 0.0)
+                continue
+            dt = dist / s
+            rel_rows[k] = (dt, dx, dx / dt, dy, dy / dt)
+
+
+def _enforce_inter_segment_accel_limit(rel_rows, max_acceleration_mm_s2, schedule):
+    """
+    Each PVT CSV row uses constant (vx, vy) over dt. At segment boundaries the commanded velocity
+    can step from v_prev to v_curr instantaneously in the discrete model; the stage then demands a
+    large Δv/dt (often clamped by firmware to an axis max such as ~80k mm/s²).
+
+    **Lead-in**, **lead-out**, and **travel** rows are always eligible. **Cut** rows are adjusted
+    **only** when the **previous** segment is **not** cut (entry from lead-in, travel, or sync)—e.g.
+    the first cut chord after air motion where ‖Δv‖ would otherwise spike (~50 mm/s Y in a 20 ms row).
+    **Interior** cut rows (cut → cut) are left unchanged so steady cut feed is not slowed.
+
+    For adjusted rows:
+
+        ‖v_curr − v_prev‖ ≤ max_acceleration_mm_s2 × dt_curr
+
+    by increasing dt while keeping (dx, dy) fixed (vx, vy recomputed as dx/dt, dy/dt). The first row
+    uses v_prev = 0 (sync row is separate). Does not change laser on/off scheduling.
+    """
+    if max_acceleration_mm_s2 <= 1e-12:
+        return
+    tol = 1e-6 * max(1.0, float(max_acceleration_mm_s2))
+    vpx, vpy = 0.0, 0.0
+
+    for i in range(len(rel_rows)):
+        kind = _schedule_kind_at_segment_index(schedule, i)
+        prev_is_cut = i > 0 and _schedule_kind_at_segment_index(schedule, i - 1) == "cut"
+        interior_cut = kind == "cut" and prev_is_cut
+        if interior_cut:
+            dt0, dx, vx, dy, vy = rel_rows[i]
+            dist = float(math.hypot(float(dx), float(dy)))
+            if dist <= 1e-15:
+                vpx, vpy = 0.0, 0.0
+            else:
+                vpx, vpy = float(vx), float(vy)
+            continue
+
+        dt0, dx, _vx, dy, _vy = rel_rows[i]
+        dx, dy = float(dx), float(dy)
+        dist = float(math.hypot(dx, dy))
+        dt_orig = float(dt0)
+        if dist <= 1e-15:
+            rel_rows[i] = (max(dt_orig, 1e-9), dx, 0.0, dy, 0.0)
+            vpx, vpy = 0.0, 0.0
+            continue
+        if dt_orig <= 1e-15:
+            dt_orig = max(dist / max(max_acceleration_mm_s2 * 1e-6, 1e-9), 1e-9)
+
+        def feasible(dt_try: float) -> bool:
+            if dt_try <= 1e-15:
+                return False
+            vxc = dx / dt_try
+            vyc = dy / dt_try
+            return math.hypot(vxc - vpx, vyc - vpy) <= max_acceleration_mm_s2 * dt_try + tol
+
+        if feasible(dt_orig):
+            vx = dx / dt_orig
+            vy = dy / dt_orig
+            rel_rows[i] = (dt_orig, dx, vx, dy, vy)
+            vpx, vpy = vx, vy
+            continue
+
+        hi = max(
+            dt_orig,
+            math.sqrt(dist / max_acceleration_mm_s2) if max_acceleration_mm_s2 > 1e-12 else dt_orig,
+        )
+        guard = 0
+        while not feasible(hi) and guard < 80:
+            hi *= 2.0
+            guard += 1
+        if not feasible(hi):
+            vx = dx / hi
+            vy = dy / hi
+            rel_rows[i] = (hi, dx, vx, dy, vy)
+            vpx, vpy = vx, vy
+            continue
+
+        lo = dt_orig
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if feasible(mid):
+                hi = mid
+            else:
+                lo = mid
+        dt_new = hi
+        vx = dx / dt_new
+        vy = dy / dt_new
+        rel_rows[i] = (dt_new, dx, vx, dy, vy)
+        vpx, vpy = vx, vy
+
+
 def _default_rapid_max_velocity_mm_s(max_velocity, max_acceleration, spacing_mm):
     """
     Peak speed scale for a spacing-sized chord under symmetric accel (triangle profile):
@@ -1788,6 +1945,9 @@ def generate_csv_from_points(
         dx = float(p1[0] - p0[0])
         dy = float(p1[1] - p0[1])
         rel_rows.append((dt, dx, vx, dy, vy))
+
+    _apply_non_cut_joint_velocity_matching(rel_rows, segs, schedule, rapid_v, max_acceleration)
+    _enforce_inter_segment_accel_limit(rel_rows, max_acceleration, schedule)
 
     for dst, src in replay.items():
         if 0 <= dst < len(rel_rows) and 0 <= src < len(rel_rows):
