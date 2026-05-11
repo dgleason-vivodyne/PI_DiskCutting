@@ -1618,12 +1618,13 @@ def build_export_segments_with_leads(
     travel_fillet_chord_extra_mm: float = 0.0,
     travel_fillet_chord_fraction: float = 1.0,
     travel_fillet_lead_out_arc_length_max_mm: float | None = None,
+    lead_straight_velocity_mm_s: float | None = None,
 ):
     """
     Build ordered motion segments: per contour (lead-in -> cut polyline with overlap ->
     lead-out), then travel to the next contour's lead-in start.
 
-    Lead-in/out keep a straight collinear segment of length ``L = v_max^2/(2 a_tan)`` immediately
+    Lead-in/out keep a straight collinear segment of length ``L = v_lead^2/(2 a_tan)`` immediately
     before/after the cut: **lead-in** is (approach fillet if any) then **L** flush to the cut start;
     **lead-out** is **L** flush from the cut end to ``E = p_end + L dir_out``. When another contour
     follows, an optional arc at ``E`` blends into inter-contour travel; the **final** contour omits
@@ -1645,8 +1646,20 @@ def build_export_segments_with_leads(
     Returns ``(segs, replay, schedule)`` where ``segs`` is a list of (p0, p1), ``replay`` maps
     destination segment index -> source index for overlap retrace, and ``schedule`` is a list of
     (kind, lo, hi) with hi exclusive segment indices into ``segs``.
+
+    ``lead_straight_velocity_mm_s``: optional velocity used **only** to compute ``L`` (collinear
+    flush segment before/after cut). When ``None``, ``L`` uses ``max_velocity``. Use a larger value
+    when ``max_velocity`` is lowered for CSV timing but tangent lead-in/out length should stay
+    physically meaningful (otherwise ``L`` shrinks as ``v^2`` and straight leads vanish).
     """
-    L = _lead_length_mm(max_velocity, max_acceleration)
+    v_lead_geom = (
+        float(lead_straight_velocity_mm_s)
+        if lead_straight_velocity_mm_s is not None
+        else float(max_velocity)
+    )
+    if v_lead_geom <= 1e-15:
+        v_lead_geom = float(max_velocity)
+    L = _lead_length_mm(v_lead_geom, max_acceleration)
     theta_min_rad = math.radians(float(travel_fillet_min_turn_deg))
     O = np.asarray(cad_origin_xy, dtype=float).reshape(2)
 
