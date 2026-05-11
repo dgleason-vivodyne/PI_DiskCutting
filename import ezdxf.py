@@ -1833,7 +1833,8 @@ def generate_csv_from_points(
     travel_fillet_chord_extra_mm: float = 0.0,
     travel_fillet_chord_fraction: float = 1.0,
     travel_fillet_lead_out_arc_length_max_mm: float | None = None,
-    rapid_max_velocity_mm_s=None,
+    rapid_max_velocity_mm_s: float | None = 100,
+    lead_straight_velocity_mm_s: float | None = None,
 ):
     """
     Writes the main PVT CSV with laser I/O only around **cut** motion (not during lead-in/out or
@@ -1871,6 +1872,16 @@ def generate_csv_from_points(
     If ``None``, defaults to ``min(max_velocity, sqrt(max_acceleration * spacing / 2))``, i.e. the
     peak speed of a spacing-sized symmetric-accel move — similar to dense cut sampling so long
     travel chords do not cruise at full ``max_velocity``. Pass a positive float to override.
+
+    Within each contiguous **non-cut** block, scalar speed ``|v|`` is unified across segments so
+    joints do not jump speed (heading still steps chord-to-chord). Cut timing is unchanged.
+
+    After rows are built, ``_enforce_inter_segment_accel_limit`` lengthens segment durations when
+    needed so ``‖Δv‖ ≤ max_acceleration × dt`` between consecutive rows for **lead-in / lead-out /
+    travel** and for the **first cut chord after non-cut** (interior **cut → cut** rows stay fixed).
+
+    ``lead_straight_velocity_mm_s``: passed through to ``build_export_segments_with_leads`` for the
+    collinear lead length ``L`` only (see there). ``None`` means ``L`` follows ``max_velocity``.
     """
     fuzz = 0.001
     overlap_n = max(0, int(overlap_count))
@@ -1937,6 +1948,7 @@ def generate_csv_from_points(
         travel_fillet_chord_extra_mm=travel_fillet_chord_extra_mm,
         travel_fillet_chord_fraction=travel_fillet_chord_fraction,
         travel_fillet_lead_out_arc_length_max_mm=travel_fillet_lead_out_arc_length_max_mm,
+        lead_straight_velocity_mm_s=lead_straight_velocity_mm_s,
     )
     if not segs:
         raise ValueError("No export segments (empty path).")
@@ -2011,6 +2023,11 @@ def generate_csv_from_points(
         ),
         "max_velocity_mm_s": float(max_velocity),
         "rapid_max_velocity_mm_s": rapid_v,
+        "lead_straight_velocity_mm_s": float(
+            lead_straight_velocity_mm_s
+            if lead_straight_velocity_mm_s is not None
+            else max_velocity
+        ),
         "max_acceleration_mm_s2": float(max_acceleration),
         "spacing_mm": float(spacing),
         "relative_csv_columns": ["time_s", "delta_x_mm", "vx_mm_s", "delta_y_mm", "vy_mm_s"],
