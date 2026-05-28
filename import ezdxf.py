@@ -1687,15 +1687,12 @@ def build_export_segments_with_leads(
         B_exp = p_start - L * dir_in
         anchor_snap_tol = max(0.05, float(spacing) * 10.0)
         anchor_snap = float(np.linalg.norm(next_lead_anchor - B_exp)) <= anchor_snap_tol
-        # First contour: drop only the travel fillet arc before the cut; keep the collinear L along
-        # ``-dir_in`` (``B_exp`` → ``p_start``). If the anchor is not on that line, approach with a
-        # straight segment to ``B_exp``, not to ``p_start`` (which would skip the tangent lead-in).
-        if k == 1 or anchor_snap:
-            _append_straight_segment_single(segs, next_lead_anchor, p_start)
-        elif k == 0:
-            if not anchor_snap:
-                _append_straight_segment_single(segs, next_lead_anchor, B_exp)
+        # First contour: DMS moves from CAD origin to ``origin_xy_mm`` from the sibling meta JSON.
+        # Do not also emit that CAD-origin -> lead-entry move in the relative PVT CSV.
+        if k == 0:
             _append_straight_segment_single(segs, B_exp, p_start)
+        elif k == 1 or anchor_snap:
+            _append_straight_segment_single(segs, next_lead_anchor, p_start)
         else:
             _P, d_li, R_li, u_li, th_li, T1_li, T2_li = _solve_travel_corner_fillet_fixed_radius(
                 p_start, dir_in, L, next_lead_anchor, travel_fillet_radius_mm, theta_min_rad
