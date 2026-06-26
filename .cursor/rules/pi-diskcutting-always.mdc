@@ -1,0 +1,25 @@
+---
+description: PI_DiskCutting — Python PVT export, safety, and agent doc map
+alwaysApply: true
+---
+
+# PI_DiskCutting context
+
+This workspace exports **PVT CSV** and **`*.pvt.meta.json`** from **DXF** for **DMS** laser cutting. Primary entry: **`import ezdxf.py`**.
+
+## Safety
+
+- Do **not** change **mm scale, default velocity/acceleration, coordinate frame conventions, or meta JSON schema** without **explicit user approval** when those values affect real hardware via DMS.
+- Downstream behavior is documented in the **DMS** repo: `PVT_BUFFER_LOAD_RECIPE.md`, `PvtCadMetaJson.cs`, `LaserService.cs`.
+
+## Verify
+
+- After Python edits, run **`py_compile`** or a small export smoke test as appropriate; follow project conventions if `pytest` or `uv` is introduced later.
+
+## Agent docs
+
+| File | Role |
+|------|------|
+| **`MISTAKES_TO_AVOID.md`**, **`USER_INTENT.md`** | Short stubs; HC2 archives: **`docs/archive/*.md`**. |
+| **`CURRENT_PLAN.md`** | Active plan pointer. |
+| **`../DMS/...`** | Consumer of PVT + meta (sibling repo). |

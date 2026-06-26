@@ -1,7 +1,5 @@
 # PI_DiskCutting
 
-Python tooling to turn DXF geometry into PVT CSV for the disk laser path (contour ordering, bridging, overlap).
+Python tooling to produce PVT CSV and `*.pvt.meta.json` from DXF (`import ezdxf.py`) for **DMS** laser disk cutting.
 
-- **Entry script:** `import ezdxf.py` (Visual Studio startup file in `Disk_Designs.pyproj`).
-- **CSV column contract for DMS:** see `CSV_DMS_README.txt`.
-- **Dependencies:** `requirements.txt` (use the `env` virtual environment if present).
+**Agent / planning stubs (repo root):** `MISTAKES_TO_AVOID.md`, `USER_INTENT.md`, `CURRENT_PLAN.md`. Optional HC2 reference texts: `docs/archive/`. Cursor rules: `.cursor/rules/`.
