@@ -2143,33 +2143,6 @@ def build_export_segments_with_leads(
                 did_travel = True
             else:
                 travel_from = E
-                _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
-                    p_next,
-                    dn,
-                    L,
-                    E,
-                    travel_fillet_radius_mm,
-                    theta_min_rad,
-                )
-                lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
-                lo_arc = _solve_lead_out_arc_after_decel_straight(
-                    E,
-                    dir_out,
-                    u_tr0,
-                    lc_travel,
-                    travel_fillet_radius_mm,
-                    theta_min_rad,
-                    chord_extra_mm=travel_fillet_chord_extra_mm,
-                    chord_fraction=travel_fillet_chord_fraction,
-                    arc_length_max_mm=travel_fillet_lead_out_arc_length_max_mm,
-                )
-                if lo_arc is not None:
-                    C_e, R_e, T2_e = lo_arc
-                    _append_arc_segments_densified(segs, C_e, R_e, E, T2_e, spacing, tangent_from_a=dir_out)
-                    travel_from = T2_e
-                else:
-                    travel_from = E
-
                 lo_hi_lead = len(segs)
 
                 tr_lo = len(segs)
@@ -2691,7 +2664,7 @@ if __name__ == '__main__':
     # Compute time and velocity for optimized path (plot)
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
 
-    output_csv = dxf_file.replace(".dxf", "_pvt.csv")
+    output_csv = os.path.splitext(dxf_file)[0] + "_pvt.csv"
     generate_csv_from_points(
         optimized_points,
         output_csv,
@@ -2712,28 +2685,4 @@ if __name__ == '__main__':
         csv_path=output_csv,
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
-    )
-
-    overlap_count, overlap_fraction = prompt_overlap_settings()
-
-    dense_travel = prompt_dense_travel()
-
-    optimized_points = build_cutting_path_with_bridges(
-        contours_ordered,
-        spacing,
-        overlap_count=overlap_count,
-        overlap_fraction=overlap_fraction,
-        dense_travel=dense_travel,
-    )
-
-    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(
-        optimized_points, max_velocity, max_acceleration
-    )
-
-    output_csv = os.path.splitext(dxf_resolved)[0] + "_pvt.csv"
-    generate_csv_from_points(optimized_points, output_csv, max_velocity, max_acceleration, spacing_mm=spacing)
-
-    preview_png = os.path.splitext(dxf_resolved)[0] + "_preview.png"
-    plot_points_with_velocity_vectors(
-        optimized_points, horizontal_velocities, vertical_velocities, save_path=preview_png
     )
