@@ -1703,6 +1703,14 @@ def _choose_arc_sweep_align_tangent_at_a(ta: float, tb: float, tangent_from_a: n
     return float(best_phi)
 
 
+def _arc_start_tangent_for_sweep(ta: float, phi: float) -> np.ndarray:
+    """Unit tangent leaving the start angle ``ta`` for a sweep ``phi``."""
+    ccw = np.array([-math.sin(ta), math.cos(ta)], dtype=float)
+    if phi >= 0.0:
+        return ccw
+    return -ccw
+
+
 def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing, tangent_from_a=None):
     """
     Circular arc from ``p_a`` to ``p_b`` on center ``C``, radius ``r``, densified.
@@ -1729,6 +1737,13 @@ def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing, tangent_from_a
         phi = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
     else:
         phi = _choose_arc_sweep_align_tangent_at_a(ta, tb, tangent_from_a)
+        tan_score = float(np.dot(_arc_start_tangent_for_sweep(ta, phi), _unit2d(tangent_from_a)))
+        if tan_score < 0.5:
+            _append_straight_segment_single(segs, a, b)
+            return
+    if abs(phi) > math.pi + 1e-9:
+        _append_straight_segment_single(segs, a, b)
+        return
     arc_len = abs(rr * phi)
     step = max(float(spacing), 1e-9)
     n = max(2, int(math.ceil(arc_len / step)))
@@ -1848,23 +1863,37 @@ def _try_append_unified_inter_contour_transition(
     dn_u = _unit2d(dn)
     B = p_next - float(L) * dn_u
 
-    cross = _cross2d(dir_u, dn_u)
-    if abs(cross) < 1e-12:
+    def _straight_fallback():
         _append_straight_segment_single(segs, E, B)
         return True, B.copy()
+
+    cross = _cross2d(dir_u, dn_u)
+    if abs(cross) < 1e-12:
+        return _straight_fallback()
 
     diff = B - E
     t_hit = float(_cross2d(diff, dn_u) / cross)
     V = E + t_hit * dir_u
 
     if t_hit < -1e-5:
-        return False, None
+        return _straight_fallback()
 
     lv = float(np.linalg.norm(V - E))
     lb = float(np.linalg.norm(V - B))
     if lv < 1e-9 or lb < 1e-9:
-        _append_straight_segment_single(segs, E, B)
-        return True, B.copy()
+        return _straight_fallback()
+
+    direct = float(np.linalg.norm(B - E))
+    via_vertex = lv + lb
+    detour_cap = max(2.0 * direct, direct + 5.0) if direct > 1e-9 else 5.0
+    if lv > detour_cap or lb > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9 and via_vertex > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9:
+        u_eb = (B - E) / direct
+        if abs(_cross2d(V - E, u_eb)) > detour_cap:
+            return _straight_fallback()
 
     # ``u_ve`` points V→E; motion toward the corner runs E→V (−u_ve). ``u_vb`` points V→B (departure).
     # Fillet turn angle is the **path deflection** ψ between −u_ve and u_vb, not the acute angle between u_ve and u_vb.
@@ -1872,10 +1901,6 @@ def _try_append_unified_inter_contour_transition(
     u_vb = _unit2d(B - V)
     cos_psi = float(np.clip(np.dot(-u_ve, u_vb), -1.0, 1.0))
     psi = float(math.acos(cos_psi))
-
-    def _straight_fallback():
-        _append_straight_segment_single(segs, E, B)
-        return True, B.copy()
 
     if psi < float(theta_min_rad):
         return _straight_fallback()
@@ -1899,6 +1924,12 @@ def _try_append_unified_inter_contour_transition(
 
     T1 = V + d * u_ve
     T2 = V + d * u_vb
+
+    planned_len = float(np.linalg.norm(T1 - E)) + float(R_use * psi) + float(np.linalg.norm(B - T2))
+    if direct > 1e-9 and float(np.linalg.norm(T1 - E)) > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9 and planned_len > detour_cap:
+        return _straight_fallback()
 
     chord_et = np.asarray(T1, dtype=float).reshape(2) - E.reshape(2)
     tan_in = _unit2d(chord_et) if float(np.linalg.norm(chord_et)) > 1e-9 else (-u_ve).copy()
