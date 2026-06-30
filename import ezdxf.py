@@ -1124,8 +1124,19 @@ def flatten_contours_with_per_contour_overlap(
 # Function to compute time based on max velocity and max acceleration
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
     """Calculate the time to move a given distance considering max velocity and max acceleration."""
-    if distance == 0:  # Avoid division by zero in case of zero distance
-        return 0
+    distance = abs(float(distance))
+    if distance <= 1e-15:
+        return 0.0
+    v_max = float(max_velocity)
+    accel = float(max_acceleration)
+    if v_max <= 0 or accel <= 0:
+        raise ValueError("max_velocity and max_acceleration must be positive")
+
+    t_accel = v_max / accel
+    d_accel = 0.5 * accel * t_accel * t_accel
+    if distance <= 2.0 * d_accel:
+        return 2.0 * math.sqrt(distance / accel)
+    return 2.0 * t_accel + (distance - 2.0 * d_accel) / v_max
 
 
 def orient_open_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last):
@@ -1196,11 +1207,26 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
     for i in range(1, len(points)):
         p1, p2 = np.array(points[i - 1]), np.array(points[i])
         dist = float(np.linalg.norm(p2 - p1))
+        time_needed = calculate_time_to_move(dist, max_velocity, max_acceleration)
+        relative_times.append(relative_times[-1] + time_needed)
+        if dist <= 1e-15 or time_needed <= 1e-15:
+            horizontal_velocity = 0.0
+            vertical_velocity = 0.0
+        else:
+            horizontal_velocity = (p2[0] - p1[0]) / time_needed
+            vertical_velocity = (p2[1] - p1[1]) / time_needed
+        horizontal_velocities.append(horizontal_velocity)
+        vertical_velocities.append(vertical_velocity)
 
-    dense=True: sample along the segment at ~`spacing` (many rows for long jumps — matches
-      cut sampling density; smoother PVT).
-    dense=False: only endpoints (2 points if distinct) — far fewer rows; motion planner still
-      gets one straight segment (velocity profile may be harsher).
+    return relative_times, horizontal_velocities, vertical_velocities
+
+
+def bridge_points_between_contours(prev_exit, entry, spacing, dense=True):
+    """
+    Points from one contour exit to the next contour entry.
+
+    ``dense=True`` samples along the segment at approximately ``spacing`` for smoother PVT.
+    ``dense=False`` returns only endpoints, leaving the motion planner one straight segment.
     """
     a = np.asarray(prev_exit, dtype=float).reshape(2)
     b = np.asarray(entry, dtype=float).reshape(2)
@@ -1209,14 +1235,6 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
     if dense:
         return interpolate_line_2d(a, b, spacing)
     return np.vstack([a, b])
-
-        # Zero-length step: calculate_time_to_move returns 0; avoid divide-by-zero / invalid velocity
-        if dist <= 1e-15 or time_needed <= 1e-15:
-            horizontal_velocity = 0.0
-            vertical_velocity = 0.0
-        else:
-            horizontal_velocity = (p2[0] - p1[0]) / time_needed
-            vertical_velocity = (p2[1] - p1[1]) / time_needed
 
 def dedupe_consecutive_points(points, eps_mm):
     """Drop consecutive rows at the same location (stitch duplicates, float noise)."""
