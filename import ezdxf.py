@@ -943,6 +943,8 @@ def optimize_contour_chunks_travel_greedy(
     travel_fillet_min_turn_deg: float = 25.0,
     greedy_unified_fail_penalty_mm: float = 100.0,
     greedy_sharp_turn_penalty_mm_per_rad: float = 10.0,
+    greedy_lookahead_weight: float = 1.0,
+    greedy_crossing_penalty_mm: float = 1_000_000.0,
 ):
     """
     Reorder contours and choose seam (closed loops) and direction to shorten Euclidean rapid moves
@@ -979,6 +981,12 @@ def optimize_contour_chunks_travel_greedy(
         (unified transition unavailable).
     greedy_sharp_turn_penalty_mm_per_rad : float
         Cost multiplier on ``max(0, ψ − θ_min)`` when a filleted corner would replace straight motion.
+    greedy_lookahead_weight : float
+        Weight for one-step lookahead from a candidate contour's exit to the best next contour entry.
+        This helps closed-loop seam/direction choices avoid entering a small contour from one side
+        and immediately leaving it across the same neighbor travel path.
+    greedy_crossing_penalty_mm : float
+        Large cost added when an inter-contour travel chord intersects the target contour polyline.
 
     Returns
     -------
@@ -1020,25 +1028,45 @@ def optimize_contour_chunks_travel_greedy(
                     continue
                 var = np.asarray(var, dtype=float)
                 if use_lead:
-                    ent = _travel_polyline_lead_entry_xy(var, L_g)
-                    if len(var) >= 2:
-                        dir_in_c = _unit2d(var[1] - var[0])
-                    else:
-                        dir_in_c = np.array([1.0, 0.0], dtype=float)
-                    base = float(np.linalg.norm(ent - current))
-                    if prev_dir_out is None:
-                        d = base
-                    else:
-                        pen = _greedy_transition_arc_penalty_mm(
-                            current,
-                            prev_dir_out,
-                            ent,
-                            dir_in_c,
-                            theta_min_rad=theta_min_rad,
-                            unified_fail_penalty_mm=greedy_unified_fail_penalty_mm,
-                            sharp_turn_penalty_mm_per_rad=greedy_sharp_turn_penalty_mm_per_rad,
-                        )
-                        d = base + pen
+                    d = _greedy_lead_transition_cost(
+                        current,
+                        prev_dir_out,
+                        var,
+                        L_g,
+                        theta_min_rad,
+                        greedy_unified_fail_penalty_mm,
+                        greedy_sharp_turn_penalty_mm_per_rad,
+                        target_polyline=var if prev_dir_out is not None else None,
+                        target_closed=bool(contour_closed[i]),
+                        crossing_penalty_mm=greedy_crossing_penalty_mm,
+                    )
+                    if len(remaining) > 1 and float(greedy_lookahead_weight) > 0.0:
+                        exit_xy = _travel_polyline_lead_exit_xy(var, L_g)
+                        if len(var) >= 2:
+                            dir_out_c = _unit2d(var[-1] - var[-2])
+                        else:
+                            dir_out_c = np.array([1.0, 0.0], dtype=float)
+                        best_next = float("inf")
+                        for j in remaining:
+                            if j == i:
+                                continue
+                            for nxt in variants_per[j]:
+                                if len(nxt) < 1:
+                                    continue
+                                nxt = np.asarray(nxt, dtype=float)
+                                c_next = _greedy_lead_transition_cost(
+                                    exit_xy,
+                                    dir_out_c,
+                                    nxt,
+                                    L_g,
+                                    theta_min_rad,
+                                    greedy_unified_fail_penalty_mm,
+                                    greedy_sharp_turn_penalty_mm_per_rad,
+                                )
+                                if c_next < best_next:
+                                    best_next = c_next
+                        if math.isfinite(best_next):
+                            d += float(greedy_lookahead_weight) * best_next
                 else:
                     ent = np.asarray(var[0], dtype=float).reshape(2)
                     d = float(np.linalg.norm(ent - current))
