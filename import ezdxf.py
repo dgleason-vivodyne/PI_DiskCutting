@@ -702,6 +702,110 @@ def _greedy_transition_arc_penalty_mm(
     return max(0.0, float(sharp_turn_penalty_mm_per_rad)) * excess
 
 
+def _orientation2d(a, b, c) -> float:
+    return _cross2d(np.asarray(b, dtype=float).reshape(2) - np.asarray(a, dtype=float).reshape(2),
+                    np.asarray(c, dtype=float).reshape(2) - np.asarray(a, dtype=float).reshape(2))
+
+
+def _point_on_segment_xy(p, a, b, tol: float) -> bool:
+    p = np.asarray(p, dtype=float).reshape(2)
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    if abs(_orientation2d(a, b, p)) > float(tol):
+        return False
+    lo = np.minimum(a, b) - float(tol)
+    hi = np.maximum(a, b) + float(tol)
+    return bool(np.all(p >= lo) and np.all(p <= hi))
+
+
+def _segments_intersect_xy(a, b, c, d, tol: float = 1e-9) -> bool:
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    c = np.asarray(c, dtype=float).reshape(2)
+    d = np.asarray(d, dtype=float).reshape(2)
+    if (
+        max(a[0], b[0]) + tol < min(c[0], d[0])
+        or max(c[0], d[0]) + tol < min(a[0], b[0])
+        or max(a[1], b[1]) + tol < min(c[1], d[1])
+        or max(c[1], d[1]) + tol < min(a[1], b[1])
+    ):
+        return False
+    o1 = _orientation2d(a, b, c)
+    o2 = _orientation2d(a, b, d)
+    o3 = _orientation2d(c, d, a)
+    o4 = _orientation2d(c, d, b)
+    if (o1 * o2 < -tol) and (o3 * o4 < -tol):
+        return True
+    return (
+        _point_on_segment_xy(c, a, b, tol)
+        or _point_on_segment_xy(d, a, b, tol)
+        or _point_on_segment_xy(a, c, d, tol)
+        or _point_on_segment_xy(b, c, d, tol)
+    )
+
+
+def _segment_intersects_polyline_xy(
+    a,
+    b,
+    polyline,
+    tol: float = 1e-9,
+    closed: bool = False,
+    max_test_edges: int = 96,
+) -> bool:
+    p = np.asarray(polyline, dtype=float)
+    if len(p) < 2:
+        return False
+    if len(p) > max_test_edges + 1:
+        if closed:
+            idx = np.unique(np.linspace(0, len(p) - 1, num=max_test_edges, dtype=np.int64))
+        else:
+            idx = np.unique(np.linspace(0, len(p) - 1, num=max_test_edges + 1, dtype=np.int64))
+        p = p[idx]
+    for i in range(len(p) - 1):
+        if _segments_intersect_xy(a, b, p[i], p[i + 1], tol):
+            return True
+    if closed and len(p) > 2 and _segments_intersect_xy(a, b, p[-1], p[0], tol):
+        return True
+    return False
+
+
+def _greedy_lead_transition_cost(
+    current,
+    prev_dir_out,
+    var,
+    L_g: float,
+    theta_min_rad: float,
+    unified_fail_penalty_mm: float,
+    sharp_turn_penalty_mm_per_rad: float,
+    target_polyline=None,
+    target_closed: bool = False,
+    crossing_penalty_mm: float = 0.0,
+):
+    """Heuristic cost for travel from current lead-out anchor to a candidate contour lead-in anchor."""
+    ent = _travel_polyline_lead_entry_xy(var, L_g)
+    if len(var) >= 2:
+        dir_in_c = _unit2d(var[1] - var[0])
+    else:
+        dir_in_c = np.array([1.0, 0.0], dtype=float)
+    base = float(np.linalg.norm(ent - current))
+    cross_pen = 0.0
+    if target_polyline is not None and crossing_penalty_mm > 0.0:
+        if _segment_intersects_polyline_xy(current, ent, target_polyline, closed=target_closed):
+            cross_pen = float(crossing_penalty_mm)
+    if prev_dir_out is None:
+        return base + cross_pen
+    pen = _greedy_transition_arc_penalty_mm(
+        current,
+        prev_dir_out,
+        ent,
+        dir_in_c,
+        theta_min_rad=theta_min_rad,
+        unified_fail_penalty_mm=unified_fail_penalty_mm,
+        sharp_turn_penalty_mm_per_rad=sharp_turn_penalty_mm_per_rad,
+    )
+    return base + pen + cross_pen
+
+
 def optimize_contour_chunks_travel_greedy(
     contour_chunks,
     contour_closed,
