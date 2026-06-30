@@ -172,13 +172,124 @@ def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, 
     return ellipse_points
 
 
-def interpolate_spline(entity, spacing):
+def _vec3_xy(v):
+    return np.array((float(v.x), float(v.y)), dtype=float)
+
+
+def _distance_point_to_segment_xy(p, a, b):
+    """2D distance from point ``p`` to segment ``a``-``b``."""
+    p = np.asarray(p, dtype=float).reshape(2)
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-24:
+        return 0.0
+    t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+    closest = a + t * ab
+    return float(np.linalg.norm(p - closest))
+
+
+def _flatten_spline_with_midpoint_stats(entity, max_deviation_mm, min_segments=4):
+    """
+    Mirror ezdxf's adaptive SPLINE flattening while retaining accepted chord midpoint deviations.
+
+    The reported value is the same midpoint-to-chord metric ezdxf uses to decide whether a chord
+    is flat enough; it is a practical estimate rather than a rigorous global curve-distance proof.
+    """
+    spline = entity.construction_tool()
+    evaluator = spline.evaluator
+    knots = np.unique(np.array(spline.knots(), dtype=float))
+    if len(knots) < 2:
+        return [], None
+
+    accepted_deviations = []
+
+    def subdivide(start, end, start_t, end_t):
+        mid_t = (start_t + end_t) * 0.5
+        mid = evaluator.point(mid_t)
+        deviation = _distance_point_to_segment_xy(_vec3_xy(mid), _vec3_xy(start), _vec3_xy(end))
+        if deviation < max_deviation_mm:
+            accepted_deviations.append(deviation)
+            yield end
+        else:
+            yield from subdivide(start, mid, start_t, mid_t)
+            yield from subdivide(mid, end, mid_t, end_t)
+
+    segments = np.float64(max(int(min_segments), 1))
+    t = knots[0]
+    start_point = evaluator.point(t)
+    verts = [start_point]
+    for t1 in knots[1:]:
+        delta = (t1 - t) / segments
+        while t < t1:
+            next_t = t + delta
+            if np.isclose(next_t, t1):
+                next_t = t1
+            end_point = evaluator.point(next_t)
+            verts.extend(subdivide(start_point, end_point, t, next_t))
+            t = next_t
+            start_point = end_point
+
+    max_deviation = max(accepted_deviations) if accepted_deviations else 0.0
+    return verts, float(max_deviation)
+
+
+def _record_spline_stats(entity, stats, spacing, requested_deviation, base, dense, max_midpoint_deviation):
+    if stats is None:
+        return
+    dense = np.asarray(dense, dtype=float)
+    if len(dense) > 1:
+        segment_lengths = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        max_segment = float(np.max(segment_lengths))
+    else:
+        max_segment = 0.0
+    stats.append(
+        {
+            "handle": str(getattr(entity.dxf, "handle", "") or ""),
+            "layer": str(getattr(entity.dxf, "layer", "") or ""),
+            "spacing_mm": float(spacing),
+            "requested_max_deviation_mm": float(requested_deviation),
+            "flattened_vertices": int(len(base)),
+            "flattened_chords": int(max(len(base) - 1, 0)),
+            "emitted_points": int(len(dense)),
+            "max_emitted_segment_mm": max_segment,
+            "max_chord_midpoint_deviation_mm": max_midpoint_deviation,
+        }
+    )
+
+
+def print_spline_interpolation_stats(stats):
+    """Print a concise summary of SPLINE flattening and emitted point spacing diagnostics."""
+    if not stats:
+        return
+    total_chords = sum(s["flattened_chords"] for s in stats)
+    total_points = sum(s["emitted_points"] for s in stats)
+    max_segment = max(s["max_emitted_segment_mm"] for s in stats)
+    measured = [s for s in stats if s["max_chord_midpoint_deviation_mm"] is not None]
+    print("\nSpline interpolation diagnostics:")
+    print(f"  Splines: {len(stats)}")
+    print(f"  Flattened chords: {total_chords}; emitted points: {total_points}")
+    print(f"  Max emitted segment length: {max_segment:.6g} mm")
+    if measured:
+        worst = max(measured, key=lambda s: s["max_chord_midpoint_deviation_mm"])
+        requested = max(s["requested_max_deviation_mm"] for s in stats)
+        label = f"handle={worst['handle'] or '?'} layer={worst['layer'] or '?'}"
+        print(f"  Requested max spline deviation: <= {requested:.6g} mm")
+        print(
+            "  Estimated max chord midpoint deviation: "
+            f"{worst['max_chord_midpoint_deviation_mm']:.6g} mm ({label})"
+        )
+
+
+def interpolate_spline(entity, spacing, max_deviation_mm=None, stats=None):
     """
     Sample a DXF SPLINE entity to a 2D polyline in WCS (mm).
 
-    Uses ezdxf adaptive ``Spline.flattening(distance)`` to approximate the spline, then
-    re-densifies each resulting chord with ``spacing`` so point-to-point motion matches
-    the spacing-driven behavior used by other sampled entity types.
+    Uses ezdxf adaptive spline flattening to approximate the spline within
+    ``max_deviation_mm`` (defaults to ``spacing`` for legacy behavior), then re-densifies
+    each resulting chord with ``spacing`` so point-to-point motion matches the
+    spacing-driven behavior used by other sampled entity types.
 
     Parameters
     ----------
@@ -186,6 +297,9 @@ def interpolate_spline(entity, spacing):
         A DXF entity with dxftype ``SPLINE``.
     spacing : float
         Target segment spacing (mm); clamped to a small positive minimum.
+    max_deviation_mm : float, optional
+        Maximum spline-to-chord midpoint deviation used during flattening. Defaults to
+        ``spacing`` to preserve the previous behavior.
 
     Returns
     -------
@@ -194,9 +308,12 @@ def interpolate_spline(entity, spacing):
     if entity.dxftype() != "SPLINE":
         return None
     step = max(float(spacing), 1e-9)
-    tol = step
+    tol = step if max_deviation_mm is None else max(float(max_deviation_mm), 1e-9)
     try:
-        verts = list(entity.flattening(distance=tol))
+        verts, max_midpoint_deviation = _flatten_spline_with_midpoint_stats(entity, tol)
+        if len(verts) < 2:
+            verts = list(entity.flattening(distance=tol))
+            max_midpoint_deviation = None
     except (ValueError, AttributeError):
         return None
     if len(verts) < 2:
@@ -210,7 +327,9 @@ def interpolate_spline(entity, spacing):
             dense.extend(dense_seg)
     if len(dense) < 2:
         return None
-    return np.asarray(dense, dtype=float)
+    dense = np.asarray(dense, dtype=float)
+    _record_spline_stats(entity, stats, step, tol, base, dense, max_midpoint_deviation)
+    return dense
 
 
 def interpolate_polyline(entity, spacing):
@@ -250,7 +369,7 @@ def interpolate_polyline(entity, spacing):
     return np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
 
 
-def interpolate_entity_xy(entity, spacing):
+def interpolate_entity_xy(entity, spacing, spline_max_deviation_mm=None, spline_stats=None):
     """Sample one LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE to a polyline in WCS (mm)."""
     dt = entity.dxftype()
     if dt == "LINE":
@@ -280,7 +399,7 @@ def interpolate_entity_xy(entity, spacing):
             rotated.append((-y_shifted + center[0], x_shifted + center[1]))
         return np.array(rotated, dtype=float)
     if dt == "SPLINE":
-        return interpolate_spline(entity, spacing)
+        return interpolate_spline(entity, spacing, spline_max_deviation_mm, spline_stats)
     if dt in ("LWPOLYLINE", "POLYLINE"):
         return interpolate_polyline(entity, spacing)
     return None
@@ -449,6 +568,8 @@ def generate_contours_from_dxf(
     spacing: float,
     gap_multiplier: float = 5.0,
     min_stitch_gap_mm: float = 1.0,
+    spline_max_deviation_mm: float | None = None,
+    spline_stats=None,
 ):
     """
     Head-to-tail chains: collect LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE on allowed
@@ -483,7 +604,7 @@ def generate_contours_from_dxf(
                 segment_runs.append(current_run)
                 current_run = []
             continue
-        raw = interpolate_entity_xy(entity, spacing)
+        raw = interpolate_entity_xy(entity, spacing, spline_max_deviation_mm, spline_stats)
         if raw is None or len(raw) == 0:
             continue
         current_run.append((entity, raw))
@@ -565,7 +686,7 @@ def generate_contours_from_dxf(
     return doc, contours
 
 
-def generate_points_from_dxf(dxf_file, spacing):
+def generate_points_from_dxf(dxf_file, spacing, spline_max_deviation_mm=None, spline_stats=None):
     """
     Extract points from DXF: contours on allowed layers with primitives ordered head-to-tail.
 
@@ -588,7 +709,12 @@ def generate_points_from_dxf(dxf_file, spacing):
     ``dxf_file`` must be the path to the DXF on disk (e.g. from a file dialog when run as a script).
     """
     # dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"  # legacy hardcoded override
-    doc, contours = generate_contours_from_dxf(dxf_file, spacing)
+    doc, contours = generate_contours_from_dxf(
+        dxf_file,
+        spacing,
+        spline_max_deviation_mm=spline_max_deviation_mm,
+        spline_stats=spline_stats,
+    )
     apply_startpoint_seam_rotations(doc, contours)
     if not contours:
         return np.empty((0, 2)), [], []
@@ -2424,6 +2550,7 @@ if __name__ == '__main__':
     print(f"Using DXF: {dxf_file}")
 
     spacing = 0.01  # Spacing between points (in mm)
+    spline_max_deviation_mm = spacing  # Lower this below spacing to tighten SPLINE chord fidelity.
     max_velocity = 100  # Max velocity (in mm/sec) — CSV cut timing cap
     max_acceleration = 5000  # Max tangential acceleration (in mm/s^2)
     # Collinear lead length L = v^2/(2a). Use None to derive L from max_velocity only.
@@ -2432,7 +2559,14 @@ if __name__ == '__main__':
     travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
-    optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(dxf_file, spacing)
+    spline_stats = []
+    optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(
+        dxf_file,
+        spacing,
+        spline_max_deviation_mm=spline_max_deviation_mm,
+        spline_stats=spline_stats,
+    )
+    print_spline_interpolation_stats(spline_stats)
     if prompt_optimize_contour_travel() and len(contour_chunks) > 0:
         _v_lead_geom = (
             float(lead_straight_velocity_mm_s)
