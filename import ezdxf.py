@@ -1961,6 +1961,28 @@ def _try_append_unified_inter_contour_transition(
     return True, B.copy()
 
 
+def _validate_export_segments_near_cad_hull(segs, chunks_d, schedule, margin_mm):
+    """Refuse suspicious generated motion far outside the source CAD bounds."""
+    if not segs:
+        return
+    cad_parts = [np.asarray(c, dtype=float).reshape((-1, 2)) for c in chunks_d if len(c) > 0]
+    if not cad_parts:
+        return
+    cad_pts = np.vstack(cad_parts)
+    lo = np.min(cad_pts, axis=0) - float(margin_mm)
+    hi = np.max(cad_pts, axis=0) + float(margin_mm)
+    for j, (p0, p1) in enumerate(segs):
+        kind = _schedule_kind_at_segment_index(schedule, j)
+        for p in (p0, p1):
+            pp = np.asarray(p, dtype=float).reshape(2)
+            if np.any(pp < lo) or np.any(pp > hi):
+                raise ValueError(
+                    f"Export segment {j} ({kind}) endpoint {pp.tolist()} is outside "
+                    f"CAD hull + {float(margin_mm):.6g} mm margin "
+                    f"({lo.tolist()} .. {hi.tolist()}); refusing suspicious travel move."
+                )
+
+
 def build_export_segments_with_leads(
     full,
     starts,
@@ -2171,6 +2193,8 @@ def build_export_segments_with_leads(
         if did_travel:
             schedule.append(("travel", tr_lo, tr_hi))
 
+    hull_margin = max(5.0, float(L) + 2.0 * float(travel_fillet_radius_mm) + float(spacing) * 10.0)
+    _validate_export_segments_near_cad_hull(segs, chunks_d, schedule, hull_margin)
     return segs, replay, schedule
 
 
