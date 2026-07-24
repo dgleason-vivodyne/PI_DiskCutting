@@ -1124,6 +1124,22 @@ def dedupe_consecutive_points(points, eps_mm):
     return np.array(out, dtype=float)
 
 
+def _strip_closure_duplicate(points, eps_mm):
+    """
+    Drop a trailing vertex that duplicates the first vertex (closed contours sampled over the full
+    parameter range, e.g. ``linspace(0, 2*pi)``, close back onto their start within float noise).
+
+    Needed before appending overlap replay vertices: the near-zero closing edge would otherwise
+    become a zero-length cut segment, which exports as a ``dt=0`` PVT row that Zaber rejects
+    mid-stream. ``dedupe_consecutive_points`` cannot catch it because first/last are not
+    consecutive until the overlap block is appended.
+    """
+    p = np.asarray(points, dtype=float)
+    if len(p) >= 3 and float(np.linalg.norm(p[-1] - p[0])) < float(eps_mm):
+        return p[:-1]
+    return p
+
+
 def flatten_contours_with_per_contour_overlap(
     contour_chunks: list,
     overlap_count: int,
@@ -1132,7 +1148,8 @@ def flatten_contours_with_per_contour_overlap(
     """
     Concatenate contours in order. When ``overlap_count`` > 0, each contour is extended by
     appending its own first ``N`` vertices again (``N = min(overlap_count, len(contour))``) so the
-    seam can be re-cut before laser-off / travel to the next shape.
+    seam can be re-cut before laser-off / travel to the next shape. A trailing closure-duplicate
+    vertex is stripped first so the seam junction is a real edge, not a zero-length segment.
     """
     overlap_n = max(0, int(overlap_count))
     chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), dedupe_eps_mm) for c in contour_chunks]
@@ -1140,6 +1157,7 @@ def flatten_contours_with_per_contour_overlap(
     parts = []
     for cc in chunks_d:
         if overlap_n > 0:
+            cc = _strip_closure_duplicate(cc, dedupe_eps_mm)
             n_take = min(overlap_n, len(cc))
             parts.append(np.vstack([cc, cc[:n_take]]))
         else:
@@ -2184,7 +2202,7 @@ def generate_csv_from_points(
     travel_fillet_chord_extra_mm: float = 0.0,
     travel_fillet_chord_fraction: float = 1.0,
     travel_fillet_lead_out_arc_length_max_mm: float | None = None,
-    rapid_max_velocity_mm_s: float | None = 100,
+    rapid_max_velocity_mm_s: float | None = 15,
     lead_straight_velocity_mm_s: float | None = None,
 ):
     """
@@ -2242,6 +2260,9 @@ def generate_csv_from_points(
         chunks_d = [c for c in chunks_d if len(c) >= 1]
         if not chunks_d:
             raise ValueError("No points to export.")
+        if overlap_n > 0:
+            # Must mirror flatten_contours_with_per_contour_overlap so starts/len_c indexing matches.
+            chunks_d = [_strip_closure_duplicate(c, fuzz) for c in chunks_d]
         full = flatten_contours_with_per_contour_overlap(contour_chunks, overlap_n, fuzz)
         if len(full) < 1:
             raise ValueError("No points to export.")
@@ -2254,6 +2275,7 @@ def generate_csv_from_points(
         if len(cc) < 1:
             raise ValueError("No points to export.")
         if overlap_n > 0:
+            cc = _strip_closure_duplicate(cc, fuzz)
             n_take = min(overlap_n, len(cc))
             full = np.vstack([cc, cc[:n_take]])
         else:
@@ -2328,6 +2350,18 @@ def generate_csv_from_points(
     for dst, src in replay.items():
         if 0 <= dst < len(rel_rows) and 0 <= src < len(rel_rows):
             rel_rows[dst] = rel_rows[src]
+
+    # Zaber PVT requires strictly positive time per point; DMS only patches t=0 on the first row.
+    # A dt<=0 row mid-stream aborts the buffer upload and the job stops there — fail loudly instead.
+    for j, (dt, _dx, _vx, _dy, _vy) in enumerate(rel_rows):
+        if not (math.isfinite(dt) and dt > 0.0):
+            p0, p1 = segs[j]
+            kind = _schedule_kind_at_segment_index(schedule, j)
+            raise ValueError(
+                f"PVT motion row {j} ({kind}) has invalid time step dt={dt!r} for segment "
+                f"({p0[0]:.9g}, {p0[1]:.9g}) -> ({p1[0]:.9g}, {p1[1]:.9g}); "
+                "refusing to write a PVT file the motion controller would reject mid-upload."
+            )
 
     def _emit_motion_rows(wr, wabs, j0, j1_exclusive):
         for j in range(j0, j1_exclusive):
@@ -2626,9 +2660,12 @@ if __name__ == '__main__':
     spacing = 0.01  # Spacing between points (in mm)
     spline_max_deviation_mm = spacing  # Lower this below spacing to tighten SPLINE chord fidelity.
     max_velocity = 100  # Max velocity (in mm/sec) — CSV cut timing cap
-    max_acceleration = 5000  # Max tangential acceleration (in mm/s^2)
+    # Typical dense-cut speed ~ sqrt(a*spacing/2); 45000 @ 0.01 mm → ~15 mm/s.
+    max_acceleration = 45000  # Max tangential acceleration (in mm/s^2)
     # Collinear lead length L = v^2/(2a). Use None to derive L from max_velocity only.
-    lead_straight_velocity_mm_s = 100.0
+    # 300 keeps L ≈ 1 mm with a=45000.
+    lead_straight_velocity_mm_s = 300.0
+    rapid_max_velocity_mm_s = 15.0  # Lead-in / lead-out / travel speed cap (mm/s)
     travel_fillet_radius_mm = 0.35  # Non-cutting corner blend radius (mm); clamped by geometry
     travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
@@ -2675,6 +2712,7 @@ if __name__ == '__main__':
         spacing=spacing,
         travel_fillet_radius_mm=travel_fillet_radius_mm,
         travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
+        rapid_max_velocity_mm_s=rapid_max_velocity_mm_s,
         lead_straight_velocity_mm_s=lead_straight_velocity_mm_s,
     )
 
