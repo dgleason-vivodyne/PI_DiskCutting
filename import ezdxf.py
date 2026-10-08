@@ -165,20 +165,124 @@ def interpolate_circle(center, radius, spacing):
     return circle_points
 
 
-def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, spacing):
-    """Interpolates points along an ellipse with equal spacing."""
-    angles = np.linspace(start_param, end_param, int(2 * np.pi * max(major_axis, minor_axis) / (5 * spacing)))
-    ellipse_points = [(center[0] + np.cos(a) * major_axis, center[1] + np.sin(a) * minor_axis) for a in angles]
-    return ellipse_points
+def _vec3_xy(v):
+    return np.array((float(v.x), float(v.y)), dtype=float)
 
 
-def interpolate_spline(entity, spacing):
+def _distance_point_to_segment_xy(p, a, b):
+    """2D distance from point ``p`` to segment ``a``-``b``."""
+    p = np.asarray(p, dtype=float).reshape(2)
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-24:
+        return 0.0
+    t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+    closest = a + t * ab
+    return float(np.linalg.norm(p - closest))
+
+
+def _flatten_spline_with_midpoint_stats(entity, max_deviation_mm, min_segments=4):
+    """
+    Mirror ezdxf's adaptive SPLINE flattening while retaining accepted chord midpoint deviations.
+
+    The reported value is the same midpoint-to-chord metric ezdxf uses to decide whether a chord
+    is flat enough; it is a practical estimate rather than a rigorous global curve-distance proof.
+    """
+    spline = entity.construction_tool()
+    evaluator = spline.evaluator
+    knots = np.unique(np.array(spline.knots(), dtype=float))
+    if len(knots) < 2:
+        return [], None
+
+    accepted_deviations = []
+
+    def subdivide(start, end, start_t, end_t):
+        mid_t = (start_t + end_t) * 0.5
+        mid = evaluator.point(mid_t)
+        deviation = _distance_point_to_segment_xy(_vec3_xy(mid), _vec3_xy(start), _vec3_xy(end))
+        if deviation < max_deviation_mm:
+            accepted_deviations.append(deviation)
+            yield end
+        else:
+            yield from subdivide(start, mid, start_t, mid_t)
+            yield from subdivide(mid, end, mid_t, end_t)
+
+    segments = np.float64(max(int(min_segments), 1))
+    t = knots[0]
+    start_point = evaluator.point(t)
+    verts = [start_point]
+    for t1 in knots[1:]:
+        delta = (t1 - t) / segments
+        while t < t1:
+            next_t = t + delta
+            if np.isclose(next_t, t1):
+                next_t = t1
+            end_point = evaluator.point(next_t)
+            verts.extend(subdivide(start_point, end_point, t, next_t))
+            t = next_t
+            start_point = end_point
+
+    max_deviation = max(accepted_deviations) if accepted_deviations else 0.0
+    return verts, float(max_deviation)
+
+
+def _record_spline_stats(entity, stats, spacing, requested_deviation, base, dense, max_midpoint_deviation):
+    if stats is None:
+        return
+    dense = np.asarray(dense, dtype=float)
+    if len(dense) > 1:
+        segment_lengths = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        max_segment = float(np.max(segment_lengths))
+    else:
+        max_segment = 0.0
+    stats.append(
+        {
+            "handle": str(getattr(entity.dxf, "handle", "") or ""),
+            "layer": str(getattr(entity.dxf, "layer", "") or ""),
+            "spacing_mm": float(spacing),
+            "requested_max_deviation_mm": float(requested_deviation),
+            "flattened_vertices": int(len(base)),
+            "flattened_chords": int(max(len(base) - 1, 0)),
+            "emitted_points": int(len(dense)),
+            "max_emitted_segment_mm": max_segment,
+            "max_chord_midpoint_deviation_mm": max_midpoint_deviation,
+        }
+    )
+
+
+def print_spline_interpolation_stats(stats):
+    """Print a concise summary of SPLINE flattening and emitted point spacing diagnostics."""
+    if not stats:
+        return
+    total_chords = sum(s["flattened_chords"] for s in stats)
+    total_points = sum(s["emitted_points"] for s in stats)
+    max_segment = max(s["max_emitted_segment_mm"] for s in stats)
+    measured = [s for s in stats if s["max_chord_midpoint_deviation_mm"] is not None]
+    print("\nSpline interpolation diagnostics:")
+    print(f"  Splines: {len(stats)}")
+    print(f"  Flattened chords: {total_chords}; emitted points: {total_points}")
+    print(f"  Max emitted segment length: {max_segment:.6g} mm")
+    if measured:
+        worst = max(measured, key=lambda s: s["max_chord_midpoint_deviation_mm"])
+        requested = max(s["requested_max_deviation_mm"] for s in stats)
+        label = f"handle={worst['handle'] or '?'} layer={worst['layer'] or '?'}"
+        print(f"  Requested max spline deviation: <= {requested:.6g} mm")
+        print(
+            "  Estimated max chord midpoint deviation: "
+            f"{worst['max_chord_midpoint_deviation_mm']:.6g} mm ({label})"
+        )
+
+
+def interpolate_spline(entity, spacing, max_deviation_mm=None, stats=None):
     """
     Sample a DXF SPLINE entity to a 2D polyline in WCS (mm).
 
-    Uses ezdxf adaptive ``Spline.flattening(distance)`` to approximate the spline, then
-    re-densifies each resulting chord with ``spacing`` so point-to-point motion matches
-    the spacing-driven behavior used by other sampled entity types.
+    Uses ezdxf adaptive spline flattening to approximate the spline within
+    ``max_deviation_mm`` (defaults to ``spacing`` for legacy behavior), then re-densifies
+    each resulting chord with ``spacing`` so point-to-point motion matches the
+    spacing-driven behavior used by other sampled entity types.
 
     Parameters
     ----------
@@ -186,6 +290,9 @@ def interpolate_spline(entity, spacing):
         A DXF entity with dxftype ``SPLINE``.
     spacing : float
         Target segment spacing (mm); clamped to a small positive minimum.
+    max_deviation_mm : float, optional
+        Maximum spline-to-chord midpoint deviation used during flattening. Defaults to
+        ``spacing`` to preserve the previous behavior.
 
     Returns
     -------
@@ -194,9 +301,12 @@ def interpolate_spline(entity, spacing):
     if entity.dxftype() != "SPLINE":
         return None
     step = max(float(spacing), 1e-9)
-    tol = step
+    tol = step if max_deviation_mm is None else max(float(max_deviation_mm), 1e-9)
     try:
-        verts = list(entity.flattening(distance=tol))
+        verts, max_midpoint_deviation = _flatten_spline_with_midpoint_stats(entity, tol)
+        if len(verts) < 2:
+            verts = list(entity.flattening(distance=tol))
+            max_midpoint_deviation = None
     except (ValueError, AttributeError):
         return None
     if len(verts) < 2:
@@ -210,7 +320,9 @@ def interpolate_spline(entity, spacing):
             dense.extend(dense_seg)
     if len(dense) < 2:
         return None
-    return np.asarray(dense, dtype=float)
+    dense = np.asarray(dense, dtype=float)
+    _record_spline_stats(entity, stats, step, tol, base, dense, max_midpoint_deviation)
+    return dense
 
 
 def interpolate_polyline(entity, spacing):
@@ -250,7 +362,7 @@ def interpolate_polyline(entity, spacing):
     return np.array([[float(v.x), float(v.y)] for v in verts], dtype=float)
 
 
-def interpolate_entity_xy(entity, spacing):
+def interpolate_entity_xy(entity, spacing, spline_max_deviation_mm=None, spline_stats=None):
     """Sample one LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE to a polyline in WCS (mm)."""
     dt = entity.dxftype()
     if dt == "LINE":
@@ -268,19 +380,10 @@ def interpolate_entity_xy(entity, spacing):
         circ_pts = interpolate_circle(center, entity.dxf.radius, spacing)
         return np.array(circ_pts, dtype=float)
     if dt == "ELLIPSE":
-        center = (entity.dxf.center.x, entity.dxf.center.y)
-        major_axis = entity.dxf.major_axis.magnitude
-        minor_axis = major_axis * entity.dxf.ratio
-        ellipse_points = interpolate_ellipse(
-            center, major_axis, minor_axis, entity.dxf.start_param, entity.dxf.end_param, spacing
-        )
-        rotated = []
-        for (x, y) in ellipse_points:
-            x_shifted, y_shifted = x - center[0], y - center[1]
-            rotated.append((-y_shifted + center[0], x_shifted + center[1]))
-        return np.array(rotated, dtype=float)
+        count = max(2, int(2 * np.pi * entity.dxf.major_axis.magnitude / (5 * spacing)))
+        return np.array([_vec3_xy(v) for v in entity.vertices(entity.params(count))])
     if dt == "SPLINE":
-        return interpolate_spline(entity, spacing)
+        return interpolate_spline(entity, spacing, spline_max_deviation_mm, spline_stats)
     if dt in ("LWPOLYLINE", "POLYLINE"):
         return interpolate_polyline(entity, spacing)
     return None
@@ -449,6 +552,8 @@ def generate_contours_from_dxf(
     spacing: float,
     gap_multiplier: float = 5.0,
     min_stitch_gap_mm: float = 1.0,
+    spline_max_deviation_mm: float | None = None,
+    spline_stats=None,
 ):
     """
     Head-to-tail chains: collect LINE/ARC/CIRCLE/ELLIPSE/SPLINE/LWPOLYLINE/POLYLINE on allowed
@@ -483,7 +588,7 @@ def generate_contours_from_dxf(
                 segment_runs.append(current_run)
                 current_run = []
             continue
-        raw = interpolate_entity_xy(entity, spacing)
+        raw = interpolate_entity_xy(entity, spacing, spline_max_deviation_mm, spline_stats)
         if raw is None or len(raw) == 0:
             continue
         current_run.append((entity, raw))
@@ -565,7 +670,7 @@ def generate_contours_from_dxf(
     return doc, contours
 
 
-def generate_points_from_dxf(dxf_file, spacing):
+def generate_points_from_dxf(dxf_file, spacing, spline_max_deviation_mm=None, spline_stats=None):
     """
     Extract points from DXF: contours on allowed layers with primitives ordered head-to-tail.
 
@@ -588,7 +693,12 @@ def generate_points_from_dxf(dxf_file, spacing):
     ``dxf_file`` must be the path to the DXF on disk (e.g. from a file dialog when run as a script).
     """
     # dxf_file = "C:/Users/DaveGleason/Desktop/FILETEST/SingleChipUpperLung.dxf"  # legacy hardcoded override
-    doc, contours = generate_contours_from_dxf(dxf_file, spacing)
+    doc, contours = generate_contours_from_dxf(
+        dxf_file,
+        spacing,
+        spline_max_deviation_mm=spline_max_deviation_mm,
+        spline_stats=spline_stats,
+    )
     apply_startpoint_seam_rotations(doc, contours)
     if not contours:
         return np.empty((0, 2)), [], []
@@ -702,6 +812,110 @@ def _greedy_transition_arc_penalty_mm(
     return max(0.0, float(sharp_turn_penalty_mm_per_rad)) * excess
 
 
+def _orientation2d(a, b, c) -> float:
+    return _cross2d(np.asarray(b, dtype=float).reshape(2) - np.asarray(a, dtype=float).reshape(2),
+                    np.asarray(c, dtype=float).reshape(2) - np.asarray(a, dtype=float).reshape(2))
+
+
+def _point_on_segment_xy(p, a, b, tol: float) -> bool:
+    p = np.asarray(p, dtype=float).reshape(2)
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    if abs(_orientation2d(a, b, p)) > float(tol):
+        return False
+    lo = np.minimum(a, b) - float(tol)
+    hi = np.maximum(a, b) + float(tol)
+    return bool(np.all(p >= lo) and np.all(p <= hi))
+
+
+def _segments_intersect_xy(a, b, c, d, tol: float = 1e-9) -> bool:
+    a = np.asarray(a, dtype=float).reshape(2)
+    b = np.asarray(b, dtype=float).reshape(2)
+    c = np.asarray(c, dtype=float).reshape(2)
+    d = np.asarray(d, dtype=float).reshape(2)
+    if (
+        max(a[0], b[0]) + tol < min(c[0], d[0])
+        or max(c[0], d[0]) + tol < min(a[0], b[0])
+        or max(a[1], b[1]) + tol < min(c[1], d[1])
+        or max(c[1], d[1]) + tol < min(a[1], b[1])
+    ):
+        return False
+    o1 = _orientation2d(a, b, c)
+    o2 = _orientation2d(a, b, d)
+    o3 = _orientation2d(c, d, a)
+    o4 = _orientation2d(c, d, b)
+    if (o1 * o2 < -tol) and (o3 * o4 < -tol):
+        return True
+    return (
+        _point_on_segment_xy(c, a, b, tol)
+        or _point_on_segment_xy(d, a, b, tol)
+        or _point_on_segment_xy(a, c, d, tol)
+        or _point_on_segment_xy(b, c, d, tol)
+    )
+
+
+def _segment_intersects_polyline_xy(
+    a,
+    b,
+    polyline,
+    tol: float = 1e-9,
+    closed: bool = False,
+    max_test_edges: int = 96,
+) -> bool:
+    p = np.asarray(polyline, dtype=float)
+    if len(p) < 2:
+        return False
+    if len(p) > max_test_edges + 1:
+        if closed:
+            idx = np.unique(np.linspace(0, len(p) - 1, num=max_test_edges, dtype=np.int64))
+        else:
+            idx = np.unique(np.linspace(0, len(p) - 1, num=max_test_edges + 1, dtype=np.int64))
+        p = p[idx]
+    for i in range(len(p) - 1):
+        if _segments_intersect_xy(a, b, p[i], p[i + 1], tol):
+            return True
+    if closed and len(p) > 2 and _segments_intersect_xy(a, b, p[-1], p[0], tol):
+        return True
+    return False
+
+
+def _greedy_lead_transition_cost(
+    current,
+    prev_dir_out,
+    var,
+    L_g: float,
+    theta_min_rad: float,
+    unified_fail_penalty_mm: float,
+    sharp_turn_penalty_mm_per_rad: float,
+    target_polyline=None,
+    target_closed: bool = False,
+    crossing_penalty_mm: float = 0.0,
+):
+    """Heuristic cost for travel from current lead-out anchor to a candidate contour lead-in anchor."""
+    ent = _travel_polyline_lead_entry_xy(var, L_g)
+    if len(var) >= 2:
+        dir_in_c = _unit2d(var[1] - var[0])
+    else:
+        dir_in_c = np.array([1.0, 0.0], dtype=float)
+    base = float(np.linalg.norm(ent - current))
+    cross_pen = 0.0
+    if target_polyline is not None and crossing_penalty_mm > 0.0:
+        if _segment_intersects_polyline_xy(current, ent, target_polyline, closed=target_closed):
+            cross_pen = float(crossing_penalty_mm)
+    if prev_dir_out is None:
+        return base + cross_pen
+    pen = _greedy_transition_arc_penalty_mm(
+        current,
+        prev_dir_out,
+        ent,
+        dir_in_c,
+        theta_min_rad=theta_min_rad,
+        unified_fail_penalty_mm=unified_fail_penalty_mm,
+        sharp_turn_penalty_mm_per_rad=sharp_turn_penalty_mm_per_rad,
+    )
+    return base + pen + cross_pen
+
+
 def optimize_contour_chunks_travel_greedy(
     contour_chunks,
     contour_closed,
@@ -713,6 +927,8 @@ def optimize_contour_chunks_travel_greedy(
     travel_fillet_min_turn_deg: float = 25.0,
     greedy_unified_fail_penalty_mm: float = 100.0,
     greedy_sharp_turn_penalty_mm_per_rad: float = 10.0,
+    greedy_lookahead_weight: float = 1.0,
+    greedy_crossing_penalty_mm: float = 1_000_000.0,
 ):
     """
     Reorder contours and choose seam (closed loops) and direction to shorten Euclidean rapid moves
@@ -749,6 +965,12 @@ def optimize_contour_chunks_travel_greedy(
         (unified transition unavailable).
     greedy_sharp_turn_penalty_mm_per_rad : float
         Cost multiplier on ``max(0, ψ − θ_min)`` when a filleted corner would replace straight motion.
+    greedy_lookahead_weight : float
+        Weight for one-step lookahead from a candidate contour's exit to the best next contour entry.
+        This helps closed-loop seam/direction choices avoid entering a small contour from one side
+        and immediately leaving it across the same neighbor travel path.
+    greedy_crossing_penalty_mm : float
+        Large cost added when an inter-contour travel chord intersects the target contour polyline.
 
     Returns
     -------
@@ -790,25 +1012,45 @@ def optimize_contour_chunks_travel_greedy(
                     continue
                 var = np.asarray(var, dtype=float)
                 if use_lead:
-                    ent = _travel_polyline_lead_entry_xy(var, L_g)
-                    if len(var) >= 2:
-                        dir_in_c = _unit2d(var[1] - var[0])
-                    else:
-                        dir_in_c = np.array([1.0, 0.0], dtype=float)
-                    base = float(np.linalg.norm(ent - current))
-                    if prev_dir_out is None:
-                        d = base
-                    else:
-                        pen = _greedy_transition_arc_penalty_mm(
-                            current,
-                            prev_dir_out,
-                            ent,
-                            dir_in_c,
-                            theta_min_rad=theta_min_rad,
-                            unified_fail_penalty_mm=greedy_unified_fail_penalty_mm,
-                            sharp_turn_penalty_mm_per_rad=greedy_sharp_turn_penalty_mm_per_rad,
-                        )
-                        d = base + pen
+                    d = _greedy_lead_transition_cost(
+                        current,
+                        prev_dir_out,
+                        var,
+                        L_g,
+                        theta_min_rad,
+                        greedy_unified_fail_penalty_mm,
+                        greedy_sharp_turn_penalty_mm_per_rad,
+                        target_polyline=var if prev_dir_out is not None else None,
+                        target_closed=bool(contour_closed[i]),
+                        crossing_penalty_mm=greedy_crossing_penalty_mm,
+                    )
+                    if len(remaining) > 1 and float(greedy_lookahead_weight) > 0.0:
+                        exit_xy = _travel_polyline_lead_exit_xy(var, L_g)
+                        if len(var) >= 2:
+                            dir_out_c = _unit2d(var[-1] - var[-2])
+                        else:
+                            dir_out_c = np.array([1.0, 0.0], dtype=float)
+                        best_next = float("inf")
+                        for j in remaining:
+                            if j == i:
+                                continue
+                            for nxt in variants_per[j]:
+                                if len(nxt) < 1:
+                                    continue
+                                nxt = np.asarray(nxt, dtype=float)
+                                c_next = _greedy_lead_transition_cost(
+                                    exit_xy,
+                                    dir_out_c,
+                                    nxt,
+                                    L_g,
+                                    theta_min_rad,
+                                    greedy_unified_fail_penalty_mm,
+                                    greedy_sharp_turn_penalty_mm_per_rad,
+                                )
+                                if c_next < best_next:
+                                    best_next = c_next
+                        if math.isfinite(best_next):
+                            d += float(greedy_lookahead_weight) * best_next
                 else:
                     ent = np.asarray(var[0], dtype=float).reshape(2)
                     d = float(np.linalg.norm(ent - current))
@@ -866,6 +1108,22 @@ def dedupe_consecutive_points(points, eps_mm):
     return np.array(out, dtype=float)
 
 
+def _strip_closure_duplicate(points, eps_mm):
+    """
+    Drop a trailing vertex that duplicates the first vertex (closed contours sampled over the full
+    parameter range, e.g. ``linspace(0, 2*pi)``, close back onto their start within float noise).
+
+    Needed before appending overlap replay vertices: the near-zero closing edge would otherwise
+    become a zero-length cut segment, which exports as a ``dt=0`` PVT row that Zaber rejects
+    mid-stream. ``dedupe_consecutive_points`` cannot catch it because first/last are not
+    consecutive until the overlap block is appended.
+    """
+    p = np.asarray(points, dtype=float)
+    if len(p) >= 3 and float(np.linalg.norm(p[-1] - p[0])) < float(eps_mm):
+        return p[:-1]
+    return p
+
+
 def flatten_contours_with_per_contour_overlap(
     contour_chunks: list,
     overlap_count: int,
@@ -874,7 +1132,8 @@ def flatten_contours_with_per_contour_overlap(
     """
     Concatenate contours in order. When ``overlap_count`` > 0, each contour is extended by
     appending its own first ``N`` vertices again (``N = min(overlap_count, len(contour))``) so the
-    seam can be re-cut before laser-off / travel to the next shape.
+    seam can be re-cut before laser-off / travel to the next shape. A trailing closure-duplicate
+    vertex is stripped first so the seam junction is a real edge, not a zero-length segment.
     """
     overlap_n = max(0, int(overlap_count))
     chunks_d = [dedupe_consecutive_points(np.asarray(c, dtype=float), dedupe_eps_mm) for c in contour_chunks]
@@ -882,6 +1141,7 @@ def flatten_contours_with_per_contour_overlap(
     parts = []
     for cc in chunks_d:
         if overlap_n > 0:
+            cc = _strip_closure_duplicate(cc, dedupe_eps_mm)
             n_take = min(overlap_n, len(cc))
             parts.append(np.vstack([cc, cc[:n_take]]))
         else:
@@ -894,8 +1154,19 @@ def flatten_contours_with_per_contour_overlap(
 # Function to compute time based on max velocity and max acceleration
 def calculate_time_to_move(distance, max_velocity, max_acceleration):
     """Calculate the time to move a given distance considering max velocity and max acceleration."""
-    if distance == 0:  # Avoid division by zero in case of zero distance
-        return 0
+    distance = abs(float(distance))
+    if distance <= 1e-15:
+        return 0.0
+    v_max = float(max_velocity)
+    accel = float(max_acceleration)
+    if v_max <= 0 or accel <= 0:
+        raise ValueError("max_velocity and max_acceleration must be positive")
+
+    t_accel = v_max / accel
+    d_accel = 0.5 * accel * t_accel * t_accel
+    if distance <= 2.0 * d_accel:
+        return 2.0 * math.sqrt(distance / accel)
+    return 2.0 * t_accel + (distance - 2.0 * d_accel) / v_max
 
 
 def orient_open_contour_for_bridges(pts, prev_exit, next_target, is_first, is_last):
@@ -966,11 +1237,26 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
     for i in range(1, len(points)):
         p1, p2 = np.array(points[i - 1]), np.array(points[i])
         dist = float(np.linalg.norm(p2 - p1))
+        time_needed = calculate_time_to_move(dist, max_velocity, max_acceleration)
+        relative_times.append(relative_times[-1] + time_needed)
+        if dist <= 1e-15 or time_needed <= 1e-15:
+            horizontal_velocity = 0.0
+            vertical_velocity = 0.0
+        else:
+            horizontal_velocity = (p2[0] - p1[0]) / time_needed
+            vertical_velocity = (p2[1] - p1[1]) / time_needed
+        horizontal_velocities.append(horizontal_velocity)
+        vertical_velocities.append(vertical_velocity)
 
-    dense=True: sample along the segment at ~`spacing` (many rows for long jumps — matches
-      cut sampling density; smoother PVT).
-    dense=False: only endpoints (2 points if distinct) — far fewer rows; motion planner still
-      gets one straight segment (velocity profile may be harsher).
+    return relative_times, horizontal_velocities, vertical_velocities
+
+
+def bridge_points_between_contours(prev_exit, entry, spacing, dense=True):
+    """
+    Points from one contour exit to the next contour entry.
+
+    ``dense=True`` samples along the segment at approximately ``spacing`` for smoother PVT.
+    ``dense=False`` returns only endpoints, leaving the motion planner one straight segment.
     """
     a = np.asarray(prev_exit, dtype=float).reshape(2)
     b = np.asarray(entry, dtype=float).reshape(2)
@@ -979,14 +1265,6 @@ def compute_relative_time_and_velocity(points, max_velocity, max_acceleration):
     if dense:
         return interpolate_line_2d(a, b, spacing)
     return np.vstack([a, b])
-
-        # Zero-length step: calculate_time_to_move returns 0; avoid divide-by-zero / invalid velocity
-        if dist <= 1e-15 or time_needed <= 1e-15:
-            horizontal_velocity = 0.0
-            vertical_velocity = 0.0
-        else:
-            horizontal_velocity = (p2[0] - p1[0]) / time_needed
-            vertical_velocity = (p2[1] - p1[1]) / time_needed
 
 def dedupe_consecutive_points(points, eps_mm):
     """Drop consecutive rows at the same location (stitch duplicates, float noise)."""
@@ -1427,6 +1705,14 @@ def _choose_arc_sweep_align_tangent_at_a(ta: float, tb: float, tangent_from_a: n
     return float(best_phi)
 
 
+def _arc_start_tangent_for_sweep(ta: float, phi: float) -> np.ndarray:
+    """Unit tangent leaving the start angle ``ta`` for a sweep ``phi``."""
+    ccw = np.array([-math.sin(ta), math.cos(ta)], dtype=float)
+    if phi >= 0.0:
+        return ccw
+    return -ccw
+
+
 def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing, tangent_from_a=None):
     """
     Circular arc from ``p_a`` to ``p_b`` on center ``C``, radius ``r``, densified.
@@ -1453,6 +1739,13 @@ def _append_arc_segments_densified(segs, C, r, p_a, p_b, spacing, tangent_from_a
         phi = math.atan2(math.sin(tb - ta), math.cos(tb - ta))
     else:
         phi = _choose_arc_sweep_align_tangent_at_a(ta, tb, tangent_from_a)
+        tan_score = float(np.dot(_arc_start_tangent_for_sweep(ta, phi), _unit2d(tangent_from_a)))
+        if tan_score < 0.5:
+            _append_straight_segment_single(segs, a, b)
+            return
+    if abs(phi) > math.pi + 1e-9:
+        _append_straight_segment_single(segs, a, b)
+        return
     arc_len = abs(rr * phi)
     step = max(float(spacing), 1e-9)
     n = max(2, int(math.ceil(arc_len / step)))
@@ -1572,23 +1865,37 @@ def _try_append_unified_inter_contour_transition(
     dn_u = _unit2d(dn)
     B = p_next - float(L) * dn_u
 
-    cross = _cross2d(dir_u, dn_u)
-    if abs(cross) < 1e-12:
+    def _straight_fallback():
         _append_straight_segment_single(segs, E, B)
         return True, B.copy()
+
+    cross = _cross2d(dir_u, dn_u)
+    if abs(cross) < 1e-12:
+        return _straight_fallback()
 
     diff = B - E
     t_hit = float(_cross2d(diff, dn_u) / cross)
     V = E + t_hit * dir_u
 
     if t_hit < -1e-5:
-        return False, None
+        return _straight_fallback()
 
     lv = float(np.linalg.norm(V - E))
     lb = float(np.linalg.norm(V - B))
     if lv < 1e-9 or lb < 1e-9:
-        _append_straight_segment_single(segs, E, B)
-        return True, B.copy()
+        return _straight_fallback()
+
+    direct = float(np.linalg.norm(B - E))
+    via_vertex = lv + lb
+    detour_cap = max(2.0 * direct, direct + 5.0) if direct > 1e-9 else 5.0
+    if lv > detour_cap or lb > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9 and via_vertex > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9:
+        u_eb = (B - E) / direct
+        if abs(_cross2d(V - E, u_eb)) > detour_cap:
+            return _straight_fallback()
 
     # ``u_ve`` points V→E; motion toward the corner runs E→V (−u_ve). ``u_vb`` points V→B (departure).
     # Fillet turn angle is the **path deflection** ψ between −u_ve and u_vb, not the acute angle between u_ve and u_vb.
@@ -1596,10 +1903,6 @@ def _try_append_unified_inter_contour_transition(
     u_vb = _unit2d(B - V)
     cos_psi = float(np.clip(np.dot(-u_ve, u_vb), -1.0, 1.0))
     psi = float(math.acos(cos_psi))
-
-    def _straight_fallback():
-        _append_straight_segment_single(segs, E, B)
-        return True, B.copy()
 
     if psi < float(theta_min_rad):
         return _straight_fallback()
@@ -1623,6 +1926,12 @@ def _try_append_unified_inter_contour_transition(
 
     T1 = V + d * u_ve
     T2 = V + d * u_vb
+
+    planned_len = float(np.linalg.norm(T1 - E)) + float(R_use * psi) + float(np.linalg.norm(B - T2))
+    if direct > 1e-9 and float(np.linalg.norm(T1 - E)) > detour_cap:
+        return _straight_fallback()
+    if direct > 1e-9 and planned_len > detour_cap:
+        return _straight_fallback()
 
     chord_et = np.asarray(T1, dtype=float).reshape(2) - E.reshape(2)
     tan_in = _unit2d(chord_et) if float(np.linalg.norm(chord_et)) > 1e-9 else (-u_ve).copy()
@@ -1652,6 +1961,28 @@ def _try_append_unified_inter_contour_transition(
         _append_straight_segment_single(segs, T2, B)
 
     return True, B.copy()
+
+
+def _validate_export_segments_near_cad_hull(segs, chunks_d, schedule, margin_mm):
+    """Refuse suspicious generated motion far outside the source CAD bounds."""
+    if not segs:
+        return
+    cad_parts = [np.asarray(c, dtype=float).reshape((-1, 2)) for c in chunks_d if len(c) > 0]
+    if not cad_parts:
+        return
+    cad_pts = np.vstack(cad_parts)
+    lo = np.min(cad_pts, axis=0) - float(margin_mm)
+    hi = np.max(cad_pts, axis=0) + float(margin_mm)
+    for j, (p0, p1) in enumerate(segs):
+        kind = _schedule_kind_at_segment_index(schedule, j)
+        for p in (p0, p1):
+            pp = np.asarray(p, dtype=float).reshape(2)
+            if np.any(pp < lo) or np.any(pp > hi):
+                raise ValueError(
+                    f"Export segment {j} ({kind}) endpoint {pp.tolist()} is outside "
+                    f"CAD hull + {float(margin_mm):.6g} mm margin "
+                    f"({lo.tolist()} .. {hi.tolist()}); refusing suspicious travel move."
+                )
 
 
 def build_export_segments_with_leads(
@@ -1814,33 +2145,6 @@ def build_export_segments_with_leads(
                 did_travel = True
             else:
                 travel_from = E
-                _P_probe, _, _, u_tr0, _, _, _ = _solve_travel_corner_fillet_fixed_radius(
-                    p_next,
-                    dn,
-                    L,
-                    E,
-                    travel_fillet_radius_mm,
-                    theta_min_rad,
-                )
-                lc_travel = float(np.linalg.norm(np.asarray(_P_probe - E, dtype=float).reshape(2)))
-                lo_arc = _solve_lead_out_arc_after_decel_straight(
-                    E,
-                    dir_out,
-                    u_tr0,
-                    lc_travel,
-                    travel_fillet_radius_mm,
-                    theta_min_rad,
-                    chord_extra_mm=travel_fillet_chord_extra_mm,
-                    chord_fraction=travel_fillet_chord_fraction,
-                    arc_length_max_mm=travel_fillet_lead_out_arc_length_max_mm,
-                )
-                if lo_arc is not None:
-                    C_e, R_e, T2_e = lo_arc
-                    _append_arc_segments_densified(segs, C_e, R_e, E, T2_e, spacing, tangent_from_a=dir_out)
-                    travel_from = T2_e
-                else:
-                    travel_from = E
-
                 lo_hi_lead = len(segs)
 
                 tr_lo = len(segs)
@@ -1864,6 +2168,8 @@ def build_export_segments_with_leads(
         if did_travel:
             schedule.append(("travel", tr_lo, tr_hi))
 
+    hull_margin = max(5.0, float(L) + 2.0 * float(travel_fillet_radius_mm) + float(spacing) * 10.0)
+    _validate_export_segments_near_cad_hull(segs, chunks_d, schedule, hull_margin)
     return segs, replay, schedule
 
 
@@ -1880,7 +2186,7 @@ def generate_csv_from_points(
     travel_fillet_chord_extra_mm: float = 0.0,
     travel_fillet_chord_fraction: float = 1.0,
     travel_fillet_lead_out_arc_length_max_mm: float | None = None,
-    rapid_max_velocity_mm_s: float | None = 100,
+    rapid_max_velocity_mm_s: float | None = 15,
     lead_straight_velocity_mm_s: float | None = None,
 ):
     """
@@ -1938,6 +2244,9 @@ def generate_csv_from_points(
         chunks_d = [c for c in chunks_d if len(c) >= 1]
         if not chunks_d:
             raise ValueError("No points to export.")
+        if overlap_n > 0:
+            # Must mirror flatten_contours_with_per_contour_overlap so starts/len_c indexing matches.
+            chunks_d = [_strip_closure_duplicate(c, fuzz) for c in chunks_d]
         full = flatten_contours_with_per_contour_overlap(contour_chunks, overlap_n, fuzz)
         if len(full) < 1:
             raise ValueError("No points to export.")
@@ -1950,6 +2259,7 @@ def generate_csv_from_points(
         if len(cc) < 1:
             raise ValueError("No points to export.")
         if overlap_n > 0:
+            cc = _strip_closure_duplicate(cc, fuzz)
             n_take = min(overlap_n, len(cc))
             full = np.vstack([cc, cc[:n_take]])
         else:
@@ -2024,6 +2334,18 @@ def generate_csv_from_points(
     for dst, src in replay.items():
         if 0 <= dst < len(rel_rows) and 0 <= src < len(rel_rows):
             rel_rows[dst] = rel_rows[src]
+
+    # Zaber PVT requires strictly positive time per point; DMS only patches t=0 on the first row.
+    # A dt<=0 row mid-stream aborts the buffer upload and the job stops there — fail loudly instead.
+    for j, (dt, _dx, _vx, _dy, _vy) in enumerate(rel_rows):
+        if not (math.isfinite(dt) and dt > 0.0):
+            p0, p1 = segs[j]
+            kind = _schedule_kind_at_segment_index(schedule, j)
+            raise ValueError(
+                f"PVT motion row {j} ({kind}) has invalid time step dt={dt!r} for segment "
+                f"({p0[0]:.9g}, {p0[1]:.9g}) -> ({p1[0]:.9g}, {p1[1]:.9g}); "
+                "refusing to write a PVT file the motion controller would reject mid-upload."
+            )
 
     def _emit_motion_rows(wr, wabs, j0, j1_exclusive):
         for j in range(j0, j1_exclusive):
@@ -2320,15 +2642,26 @@ if __name__ == '__main__':
     print(f"Using DXF: {dxf_file}")
 
     spacing = 0.01  # Spacing between points (in mm)
+    spline_max_deviation_mm = spacing  # Lower this below spacing to tighten SPLINE chord fidelity.
     max_velocity = 100  # Max velocity (in mm/sec) — CSV cut timing cap
-    max_acceleration = 5000  # Max tangential acceleration (in mm/s^2)
+    # Typical dense-cut speed ~ sqrt(a*spacing/2); 45000 @ 0.01 mm → ~15 mm/s.
+    max_acceleration = 45000  # Max tangential acceleration (in mm/s^2)
     # Collinear lead length L = v^2/(2a). Use None to derive L from max_velocity only.
-    lead_straight_velocity_mm_s = 100.0
+    # 300 keeps L ≈ 1 mm with a=45000.
+    lead_straight_velocity_mm_s = 300.0
+    rapid_max_velocity_mm_s = 15.0  # Lead-in / lead-out / travel speed cap (mm/s)
     travel_fillet_radius_mm = 0.35  # Non-cutting corner blend radius (mm); clamped by geometry
     travel_fillet_min_turn_deg = 25.0  # Skip fillet below this angle (deg); straighter = straight chords
 
     # DXF chain order + Startpoints seam rotation (no optimize_path — it scrambles closed curves)
-    optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(dxf_file, spacing)
+    spline_stats = []
+    optimized_points, contour_chunks, contour_closed = generate_points_from_dxf(
+        dxf_file,
+        spacing,
+        spline_max_deviation_mm=spline_max_deviation_mm,
+        spline_stats=spline_stats,
+    )
+    print_spline_interpolation_stats(spline_stats)
     if prompt_optimize_contour_travel() and len(contour_chunks) > 0:
         _v_lead_geom = (
             float(lead_straight_velocity_mm_s)
@@ -2352,7 +2685,7 @@ if __name__ == '__main__':
     # Compute time and velocity for optimized path (plot)
     times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(optimized_points, max_velocity, max_acceleration)
 
-    output_csv = dxf_file.replace(".dxf", "_pvt.csv")
+    output_csv = os.path.splitext(dxf_file)[0] + "_pvt.csv"
     generate_csv_from_points(
         optimized_points,
         output_csv,
@@ -2363,6 +2696,7 @@ if __name__ == '__main__':
         spacing=spacing,
         travel_fillet_radius_mm=travel_fillet_radius_mm,
         travel_fillet_min_turn_deg=travel_fillet_min_turn_deg,
+        rapid_max_velocity_mm_s=rapid_max_velocity_mm_s,
         lead_straight_velocity_mm_s=lead_straight_velocity_mm_s,
     )
 
@@ -2373,28 +2707,4 @@ if __name__ == '__main__':
         csv_path=output_csv,
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
-    )
-
-    overlap_count, overlap_fraction = prompt_overlap_settings()
-
-    dense_travel = prompt_dense_travel()
-
-    optimized_points = build_cutting_path_with_bridges(
-        contours_ordered,
-        spacing,
-        overlap_count=overlap_count,
-        overlap_fraction=overlap_fraction,
-        dense_travel=dense_travel,
-    )
-
-    times, horizontal_velocities, vertical_velocities = compute_relative_time_and_velocity(
-        optimized_points, max_velocity, max_acceleration
-    )
-
-    output_csv = os.path.splitext(dxf_resolved)[0] + "_pvt.csv"
-    generate_csv_from_points(optimized_points, output_csv, max_velocity, max_acceleration, spacing_mm=spacing)
-
-    preview_png = os.path.splitext(dxf_resolved)[0] + "_preview.png"
-    plot_points_with_velocity_vectors(
-        optimized_points, horizontal_velocities, vertical_velocities, save_path=preview_png
     )
