@@ -165,13 +165,6 @@ def interpolate_circle(center, radius, spacing):
     return circle_points
 
 
-def interpolate_ellipse(center, major_axis, minor_axis, start_param, end_param, spacing):
-    """Interpolates points along an ellipse with equal spacing."""
-    angles = np.linspace(start_param, end_param, int(2 * np.pi * max(major_axis, minor_axis) / (5 * spacing)))
-    ellipse_points = [(center[0] + np.cos(a) * major_axis, center[1] + np.sin(a) * minor_axis) for a in angles]
-    return ellipse_points
-
-
 def _vec3_xy(v):
     return np.array((float(v.x), float(v.y)), dtype=float)
 
@@ -387,17 +380,8 @@ def interpolate_entity_xy(entity, spacing, spline_max_deviation_mm=None, spline_
         circ_pts = interpolate_circle(center, entity.dxf.radius, spacing)
         return np.array(circ_pts, dtype=float)
     if dt == "ELLIPSE":
-        center = (entity.dxf.center.x, entity.dxf.center.y)
-        major_axis = entity.dxf.major_axis.magnitude
-        minor_axis = major_axis * entity.dxf.ratio
-        ellipse_points = interpolate_ellipse(
-            center, major_axis, minor_axis, entity.dxf.start_param, entity.dxf.end_param, spacing
-        )
-        rotated = []
-        for (x, y) in ellipse_points:
-            x_shifted, y_shifted = x - center[0], y - center[1]
-            rotated.append((-y_shifted + center[0], x_shifted + center[1]))
-        return np.array(rotated, dtype=float)
+        count = max(2, int(2 * np.pi * entity.dxf.major_axis.magnitude / (5 * spacing)))
+        return np.array([_vec3_xy(v) for v in entity.vertices(entity.params(count))])
     if dt == "SPLINE":
         return interpolate_spline(entity, spacing, spline_max_deviation_mm, spline_stats)
     if dt in ("LWPOLYLINE", "POLYLINE"):
